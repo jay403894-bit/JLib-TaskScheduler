@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+            bin: build/bin/Release
+          - name: Windows ARM64 (MSVC)
+            os: windows-11-arm
+            bin: build/bin/Release
+          - name: Linux x86-64 (GCC)
+            os: ubuntu-latest
+            bin: build/bin
+          - name: Linux AArch64 (GCC)
+            os: ubuntu-24.04-arm
+            bin: build/bin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_COROUTINES=ON
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+        shell: bash
+
+      - name: ABI harness (Windows ARM64)
+        if: matrix.os == 'windows-11-arm'
+        run: ./${{ matrix.bin }}/SchedulerFiberAbiTest.exe
+        shell: bash
+
+      - name: ABI harness at -O0 and -O2 (Linux AArch64)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          for O in 0 2; do
+            c++ -std=c++17 -O$O -g -o ft$O tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
+            ./ft$O
+          done
+        shell: bash
+
+      - name: Tests
+        run: bash tools/run_tests.sh "${{ matrix.bin }}"
+        shell: bash
+
+      - name: Bench smoke
+        run: ./${{ matrix.bin }}/SchedulerBench --cases spawn,pingpong,mutex,latency --reps 1
+        shell: bash
+
+  stats-build:
+    name: Stats build (Linux x86-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_COROUTINES=ON -DJLIBSCHED_STATS=ON
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Stats test
+        run: ./build/bin/SchedulerStatsTest
+
+  models:
+    name: Formal models (TLA+, GenMC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: TLA+ fiberresume_model
+        run: |
+          curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          java -cp /tmp/tla2tools.jar pcal.trans tests/verify/fiberresume_model.tla
+          java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto tests/verify/fiberresume_model.tla
+
+      - name: GenMC models
+        run: |
+          docker pull genmc/genmc:v0.17.0
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc -unroll=8 -- "$@"
+          }
+          run_positive() { echo "=== $* (expect: no errors) ==="; run_genmc "$@"; }
+          run_negative() {
+            echo "=== $* (expect: error) ==="
+            if run_genmc "$@"; then echo "NEGATIVE CONTROL DID NOT FAIL: $*"; exit 1; fi
+          }
+
+          run_positive tests/verify/deque_model.c
+          run_negative -DNO_POP_FENCE tests/verify/deque_model.c
+
+          run_positive tests/verify/deque_grow_model.c
+          run_negative -DNO_PUBLISH_RELEASE tests/verify/deque_grow_model.c
+          run_negative -DNO_RETIRE          tests/verify/deque_grow_model.c
+          run_negative -DSPLIT_PTR_MASK     tests/verify/deque_grow_model.c
+
+          run_positive tests/verify/mpsc_model.c
+          run_negative -DNO_APPEND_RELEASE tests/verify/mpsc_model.c
+          run_negative -DNO_POP_ACQUIRE    tests/verify/mpsc_model.c
+          run_negative -DRELAXED_XCHG      tests/verify/mpsc_model.c
+
+          run_positive tests/verify/event_model.c
+          run_negative -DNO_RELEASE tests/verify/event_model.c
+
+          run_positive tests/verify/counted_epoch_model.c
+          run_positive -DTWO_READERS     tests/verify/counted_epoch_model.c
+          run_negative -DNO_ADVANCE_GATE tests/verify/counted_epoch_model.c
+
+          run_positive tests/verify/sleepwake_model.c
+          run_negative -DACQ_REL_ONLY tests/verify/sleepwake_model.c
+          run_negative -DLANE_ONLY -DWEAK_LANEWAKE tests/verify/sleepwake_model.c
+
+          run_positive tests/verify/fiberwait_model.c
+          run_negative -DOLD_ORDERING tests/verify/fiberwait_model.c
+
+          run_positive -DCLEAR_ON_IDLE tests/verify/workerpass_model.c
+          run_positive -DCLEAR_ON_IDLE -DSEARCH_MISS -DRECHECK_FULL tests/verify/workerpass_model.c
+          run_negative -DCLEAR_ON_IDLE -DWAKE_CAS_ONLY tests/verify/workerpass_model.c
+
+      - name: GenMC WaitGroup model (safety + liveness)
+        run: |
+          docker pull genmc/genmc:v0.17.0
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc --check-liveness -unroll=8 -- "$@"
+          }
+          run_positive() { echo "=== $* (expect: no errors) ==="; run_genmc "$@"; }
+          run_negative() {
+            echo "=== $* (expect: error) ==="
+            if run_genmc "$@"; then echo "NEGATIVE CONTROL DID NOT FAIL: $*"; exit 1; fi
+          }
+          M=tests/verify/waitgroup_model.c
+          run_positive $M
+          run_positive -DBLOCK_WAITER $M
+          run_negative -DNO_SETTLE $M
+          run_negative -DPROPOSED $M
+          run_negative -DPROPOSED -DFIX_DIRECT $M
+
+      # The hunt protocol (last hunter + handoff + park). A negative control must REPORT a
+      # violation: any nonzero exit is not enough, because a GenMC crash or an unknown flag also
+      # exits nonzero and would make the control pass without testing anything.
+      - name: GenMC hunt model (liveness)
+        run: |
+          docker pull genmc/genmc:v0.17.0
+          M=tests/verify/hunt_model.c
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc --disable-estimation --check-liveness -unroll=6 -- "$@" > genmc.out 2>&1
+          }
+          must_pass() {
+            echo "=== $* (expect: no errors) ==="
+            if ! run_genmc "$@"; then tail -30 genmc.out; exit 1; fi
+            grep -m1 'complete executions' genmc.out
+          }
+          must_fail() {
+            echo "=== $* (expect: violation) ==="
+            run_genmc "$@" || true
+            if grep -qE 'INTERNAL|Unknown command line|Error opening' genmc.out || ! grep -qE 'violation' genmc.out; then
+              echo "NEGATIVE CONTROL DID NOT REPORT A VIOLATION: $*"; tail -30 genmc.out; exit 1
+            fi
+            grep -m1 -E 'violation' genmc.out
+          }
+          must_pass -DONE_LEVEL $M
+          must_fail -DONE_LEVEL -DNO_LAST_HUNTER $M
+          must_fail -DNO_LAST_HUNTER $M
+          must_fail -DOLD_PARK $M
+          must_fail -DNO_HANDOFF $M
+          # The deep pass: ~1.4 M executions, ~12 min single-threaded locally (GenMC 0.18).
+          must_pass $M
+
+      # Linden-Jonsson priority queue (extras/wip/SkipListPQ.h). Same must-report rule as above;
+      # PAPER_OBSHEAD shows up as an access past the list rather than an assert.
+      - name: GenMC skiplist priority queue model
+        run: |
+          docker pull genmc/genmc:v0.17.0
+          M=tests/verify/skiplist_pq_model.c
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc --disable-estimation -unroll=8 -- "$@" > genmc.out 2>&1
+          }
+          must_pass() {
+            echo "=== $* (expect: no errors) ==="
+            if ! run_genmc "$@"; then tail -30 genmc.out; exit 1; fi
+            grep -m1 'complete executions' genmc.out
+          }
+          must_fail() {
+            echo "=== $* (expect: violation) ==="
+            run_genmc "$@" || true
+            if grep -qE 'INTERNAL|Unknown command line|Error opening' genmc.out || \
+               ! grep -qE 'violation|race|non-allocated' genmc.out; then
+              echo "NEGATIVE CONTROL DID NOT REPORT A VIOLATION: $*"; tail -30 genmc.out; exit 1
+            fi
+            grep -m1 -E 'violation|race|non-allocated' genmc.out
+          }
+          must_pass -DCONFIG_TWO_DEL $M
+          for K in 1UL 3UL; do
+            must_pass -DINS_KEY=$K $M
+            must_pass -DINS_KEY=$K -DPRE_DELETED $M
+            must_pass -DCONFIG_INS_TWO_DEL -DINS_KEY=$K $M
+            must_pass -DCONFIG_INS_TWO_DEL -DINS_KEY=$K -DPRE_DELETED $M
+          done
+          must_pass -DINS_KEY=1UL -DBOUND=2 $M
+          must_pass -DCONFIG_INS_TWO_DEL -DINS_KEY=1UL -DBOUND=2 $M
+          must_fail -DPAPER_OBSHEAD -DCONFIG_INS_TWO_DEL -DINS_KEY=1UL $M
+          must_fail -DNO_INSERTING  -DCONFIG_INS_TWO_DEL -DINS_KEY=1UL $M
+          must_fail -DNO_SKEW_BREAK -DCONFIG_INS_TWO_DEL -DINS_KEY=1UL $M
+          must_fail -DHEAD_UNMARKED -DCONFIG_INS_TWO_DEL -DINS_KEY=3UL $M
+          must_fail -DRELAXED_LINK  -DINS_KEY=1UL $M

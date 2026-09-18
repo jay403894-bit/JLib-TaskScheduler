@@ -1,0 +1,25 @@
+name: Race hunt (Linux AArch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: Passes over the contention tests
+        default: "20"
+
+jobs:
+  hunt:
+    name: Weakly-ordered high-iteration run
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_COROUTINES=ON
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Hunt
+        run: bash tools/run_tests.sh build/bin "${{ inputs.loops }}" quick
