@@ -27,6 +27,13 @@ for i in $(seq 1 "$LOOPS"); do
     run SchedulerSlabExitTest x
     run SchedulerDagUnsubmittedTest x
     run SchedulerSkipListPqTest x
+    run SchedulerMainAwayTest x
+    run SchedulerThreadScopeTest x
+    run SchedulerBlockInPlaceTest x
+    run SchedulerBlockInPlaceTest s
+    run SchedulerBlockInPlaceTest s0
+    run SchedulerPforModeTest i
+    run SchedulerPforModeTest o
     run SchedulerLateFreeTest x
     run SchedulerMainHelpTest x
     run SchedulerMainPushToTest x

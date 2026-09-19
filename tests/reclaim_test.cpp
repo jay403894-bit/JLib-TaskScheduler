@@ -79,11 +79,17 @@ static void Holder(void*) {
 		for (int y = 0; y < 3; ++y) {
 			Thread::CoYield();
 			if (r->magic != 0xA11CE) g_sawDead.fetch_add(1);
-			// Wait on a tiny task: in Migrate the resume lands on the worker that finished it.
+			// Wait on a tiny task sent to ANOTHER worker: in Migrate the resume lands on the worker
+			// that finished it. (A plain Push from a worker stays on its own deque, so the holder
+			// would usually resume where it was and the migration this test needs would be rare.)
 			auto& s = TaskScheduler::Instance();
 			WaitGroup wg; wg.n.store(1);
 			Task* t = s.CreateTask(&Nop, nullptr);
-			t->waitGroup = &wg; s.Push(t);
+			t->waitGroup = &wg;
+			const size_t n = s.GetWorkerCount();
+			Thread* cur = Thread::GetCurrent();
+			const size_t other = (cur && cur->IsPoolWorker()) ? ((size_t)cur->qIndex + 1) % n : 0;
+			s.PushBatch(&t, 1, other, 0);
 			s.WaitFor(wg);
 			if (r->magic != 0xA11CE) g_sawDead.fetch_add(1);
 		}

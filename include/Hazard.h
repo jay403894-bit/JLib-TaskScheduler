@@ -42,6 +42,10 @@ namespace JLib {
 
         // Moves this thread's pending retires to the shared orphan store (swept by any Scan).
         void HandOffPending();
+
+        // Gives back this thread's external reader row, if it has one (ThreadScope's end). The
+        // row's cells are cleared first; a later guard on this thread claims a row again.
+        void ReleaseCurrentReader();
         std::size_t OrphanedTotal() const;
 
         void Init();

@@ -84,6 +84,37 @@ void Query(Info& out) {
     }
     out.haveCache = !out.cacheMasks.empty();
 
+    // Core classes, same convention as Windows' EfficiencyClass: higher is faster, P = maxClass.
+    // Intel hybrid: the cpu_core (P) and cpu_atom (E) PMU devices list their CPUs.
+    // ARM big.LITTLE: cpu_capacity per CPU; each distinct capacity is a class, ranked ascending.
+    // Neither present (one core class, or a VM such as WSL): every CPU stays -1, all are P.
+    std::string pText, eText;
+    if (ReadFileText("/sys/devices/cpu_core/cpus", pText) && ReadFileText("/sys/devices/cpu_atom/cpus", eText)) {
+        const CpuMask p = ParseCpuList(pText), e = ParseCpuList(eText);
+        if (p.Any() && e.Any()) {
+            for (int cpu = 0; cpu < nCpu; ++cpu) {
+                if (p.Test((CpuId)cpu))      out.efficiencyClass[cpu] = 1;
+                else if (e.Test((CpuId)cpu)) out.efficiencyClass[cpu] = 0;
+            }
+            out.maxClass = 1;
+        }
+    } else {
+        std::vector<long> cap((size_t)nCpu, -1), distinct;
+        for (int cpu = 0; cpu < nCpu; ++cpu) {
+            std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+            if (!ReadFileText(path, text)) continue;
+            cap[(size_t)cpu] = std::strtol(text.c_str(), nullptr, 10);
+            if (std::find(distinct.begin(), distinct.end(), cap[(size_t)cpu]) == distinct.end())
+                distinct.push_back(cap[(size_t)cpu]);
+        }
+        if (distinct.size() >= 2) {
+            std::sort(distinct.begin(), distinct.end());
+            for (int cpu = 0; cpu < nCpu; ++cpu)
+                if (cap[(size_t)cpu] >= 0)
+                    out.efficiencyClass[cpu] = (int)(std::find(distinct.begin(), distinct.end(), cap[(size_t)cpu]) - distinct.begin());
+            out.maxClass = (int)distinct.size() - 1;
+        }
+    }
 }
 
 }} 

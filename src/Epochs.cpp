@@ -6,7 +6,10 @@
 #include <vector>
 
 namespace JLib {
-	thread_local size_t thread_id = 0;
+	// No slot until the pool assigns one (main, workers) or a ThreadScope claims one. Defaulting to
+	// 0 silently shared main's slot with every other thread: an outside thread's guard could clear
+	// main's announcement while main was mid-traversal.
+	thread_local size_t thread_id = kNoThreadSlot;
 
 	size_t CurrentThreadId() noexcept { return thread_id; }
 

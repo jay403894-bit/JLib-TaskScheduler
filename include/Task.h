@@ -14,8 +14,11 @@ namespace JLib {
     
     struct WaitGroup;
 
-    // Fiber: runs on a fiber and may block. A lambda task (lambdaBody) is called directly on the
-    // worker's stack instead and must not suspend (asserted at every suspend point).
+    // Fiber: runs on a fiber and may block. A native task (the `native` bit: every lambda task, and
+    // fn+ctx tasks from CreateNativeTask) is called directly on the worker's stack instead and must
+    // not suspend (fatal at every suspend point); it may block the OS thread only inside
+    // TaskScheduler::BlockInPlace. For a lambda that is a lifetime proof: its closure lives in the
+    // task's slab slot, which is freed as soon as the call returns.
     // Coroutine: resumed by a direct call on the worker's stack; waits by co_await
     // (JLIBSCHED_COROUTINES, Coroutine.h).
     // Main: must run on the OS main thread. Set by PushMain; every resume/yield/requeue sends it
@@ -26,6 +29,10 @@ namespace JLib {
     enum class StackClass : uint8_t { Standard = 0, Tiny = 1, Deep = 2 };
 
     enum class Lane : uint8_t { Normal = 0, LowLatency = 1 };
+
+    // Which compute workers a push may pick, by core class. On a machine with one core class every
+    // compute worker counts as P, and E falls back to P. K is never picked.
+    enum class CorePref : uint8_t { P = 0, E = 1, Any = 2 };
 
     // Where a suspended task resumes. The suspend primitive writes it into TaskRecord::pinTo at the
     // moment of suspension; the resume path reads it once. Nothing else looks at it.
@@ -72,7 +79,7 @@ namespace JLib {
         uint8_t   priorityBoost : 1;     \
         uint8_t   trivialDtor   : 1;     \
         StackClass stackClass   : 2;     \
-        uint8_t   lambdaBody    : 1;
+        uint8_t   native    : 1;
 
     // A task's durable identity: born with the task (CreateTask), dies with it (FreeTask).
     // Holds scheduling state that follows the task; the body (a fiber today) is attached when the
@@ -118,12 +125,12 @@ namespace JLib {
             : fn(nullptr), data(nullptr), record(nullptr), next(nullptr),
               lane(Lane::Normal), type(TaskType::Fiber),
               priorityBoost(0), trivialDtor(0),
-              stackClass(StackClass::Standard), lambdaBody(0) { ; }
+              stackClass(StackClass::Standard), native(0) { ; }
         Task(Func f, void* d = nullptr, Lane ln = Lane::Normal)
             : fn(f), data(d), record(nullptr), next(nullptr),
               lane(ln), type(TaskType::Fiber),
               priorityBoost(0), trivialDtor(0),
-              stackClass(StackClass::Standard), lambdaBody(0) {
+              stackClass(StackClass::Standard), native(0) {
         }
         virtual ~Task() {
 
@@ -189,7 +196,7 @@ namespace JLib {
         {
             this->data = this;
             
-            this->lambdaBody = 1;
+            this->native = 1;
         }
 
         LambdaTask(const F& f)
@@ -197,7 +204,7 @@ namespace JLib {
             func(f)
         {
             this->data = this;
-            this->lambdaBody = 1;
+            this->native = 1;
         }
 		~LambdaTask() {
 		}

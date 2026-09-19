@@ -179,6 +179,28 @@ namespace JLib {
 
         std::atomic<int> workerState{ 0  };
 
+        // Inbox adoption (TaskScheduler::BlockBegin/End). adoptSlot: kAdoptNone, a qIndex whose
+        // normal inbox this worker drains alongside its own, or kAdoptAway (this thread is blocked in
+        // code it cannot suspend and its inbox is drained by whoever adopted it). draining: the queue
+        // being popped right now; a returning owner waits that out, never a task. Next to workerState
+        // so Wake() reads it from a line it already touches. Model: tests/verify/adopt_model.c.
+        static constexpr int kAdoptNone = -1;
+        static constexpr int kAdoptAway = -2;
+        std::atomic<int> adoptSlot{ kAdoptNone };
+        std::atomic<int> draining{ kAdoptNone };
+        int     blockDepth = 0;         // owner only
+        Thread* adopter    = nullptr;   // owner only: who adopted this thread's inbox (worker or spare)
+
+        // A spare (Config::spareThreads): an OS thread outside the slots, parked until a blocking
+        // thread claims it as adopter. It runs what it pops from the adopted inbox (RunHelped) and
+        // releases `draining` before each run, so a returning owner waits out a pop, never a task.
+        bool isSpare = false;
+        void StartSpare(size_t fiberCacheCapacity);
+        void SpareLoop();
+        // Moves up to one batch from the adopted inbox onto this worker's deque. True if it moved any.
+        bool DrainAdoptedInbox();
+        bool AdoptedInboxHasWork() const;
+
         std::atomic<bool> idleLinked{ false };
 
         bool yieldedLastPass = false;
@@ -200,10 +222,18 @@ namespace JLib {
         return EpochManager::Instance().ThreadSlot(CurrentThreadId());
     }
 
+    [[noreturn]] void FatalNoEpochSlot();   // TaskScheduler.cpp
+
+    inline std::atomic<size_t>* CurrentEpochSlotOrDie() {
+        std::atomic<size_t>* s = CurrentEpochSlot();
+        if (!s) FatalNoEpochSlot();
+        return s;
+    }
+
     class EpochGuard {
     public:
-        
-        EpochGuard() : slotted_(CurrentEpochSlot()) {}
+
+        EpochGuard() : slotted_(CurrentEpochSlotOrDie()) {}
         EpochGuard(const EpochGuard&) = delete;
         EpochGuard& operator=(const EpochGuard&) = delete;
     private:

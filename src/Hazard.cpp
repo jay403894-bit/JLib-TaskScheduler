@@ -252,6 +252,19 @@ namespace JLib {
         if (!t_retireDead) AdoptOrphans(t_retire.items);
     }
 
+    void HazardDomain::ReleaseCurrentReader() {
+        std::atomic<void*>* base = cells.load(std::memory_order_acquire);
+        if (!base || !externalOwners) return;
+        const std::uint64_t me = ThisThreadId();
+        for (std::size_t i = 0; i < kExternalReaders; ++i) {
+            if (externalOwners[i].load(std::memory_order_acquire) != me) continue;
+            std::atomic<void*>* row = base + (workerCount + i) * kCellsPerReader;
+            for (std::size_t k = 0; k < kCellsPerReader; ++k) row[k].store(nullptr, std::memory_order_release);
+            externalOwners[i].store(0, std::memory_order_release);
+            return;
+        }
+    }
+
     std::size_t HazardDomain::OrphanedRetired() const {
         return g_orphanCount.load(std::memory_order_acquire);
     }

@@ -46,6 +46,12 @@ const char* KindName(Kind k) { return k == Kind::Fiber ? "fiber" : k == Kind::Co
 
 TaskScheduler& S() { return TaskScheduler::Instance(); }
 
+// Correctness checks are FATAL, not advisory: a green table beside an ignorable stderr note is
+// exactly the failure mode a benchmark must not have. Both channels get the message (the table
+// gets pasted; stderr goes to logs) and main exits nonzero, so exit code 0 means every check held.
+bool g_checkFailed = false;
+bool g_ioOpenFailed = false;   // CaseIo: temp file unusable -> skip with a reason, print no row
+
 // ---- workloads -------------------------------------------------------------------------------
 // Each returns the number of operations it performed; the harness times it.
 
@@ -264,7 +270,13 @@ std::uint64_t CaseFib(Kind k) {
         Spawn(FibCoro(kFibN, &result), &wg);
         S().WaitFor(wg);
     }
-    if (result != 9227465) std::fprintf(stderr, "fib: wrong result %llu\n", (unsigned long long)result);
+    if (result != bench::kFibExpected) {
+        g_checkFailed = true;
+        std::fprintf(stderr, "CHECK FAILED: fib wrong result %llu (want %llu)\n",
+                     (unsigned long long)result, (unsigned long long)bench::kFibExpected);
+        std::printf("  *** CHECK FAILED: fib wrong result %llu (want %llu)\n",
+                    (unsigned long long)result, (unsigned long long)bench::kFibExpected);
+    }
     return g_fibNodes.load();
 }
 
@@ -333,8 +345,13 @@ std::uint64_t CaseMutex(Kind k) {
         S().WaitFor(wg);
     }
     const std::uint64_t want = (std::uint64_t)kMutexTasks * kMutexIters;
-    if (g_mutexCount != want) std::fprintf(stderr, "mutex: count %llu, want %llu\n",
-                                           (unsigned long long)g_mutexCount, (unsigned long long)want);
+    if (g_mutexCount != want) {   // dropped or double-counted increments -- no green row over this
+        g_checkFailed = true;
+        std::fprintf(stderr, "CHECK FAILED: mutex count %llu, want %llu\n",
+                     (unsigned long long)g_mutexCount, (unsigned long long)want);
+        std::printf("  *** CHECK FAILED: mutex count %llu, want %llu\n",
+                    (unsigned long long)g_mutexCount, (unsigned long long)want);
+    }
     return want;
 }
 
@@ -568,7 +585,11 @@ bool OpenIoFile() {
     return IoReactor::Instance().Register(g_ioHandle);
 }
 std::uint64_t CaseIo(Kind) {
-    if (!OpenIoFile()) { std::fprintf(stderr, "io: could not open the temp file\n"); return 0; }
+    if (!OpenIoFile()) {
+        g_ioOpenFailed = true;   // open fails at warmup, before any timed rep; RunOne skips on this
+        std::fprintf(stderr, "io: could not open the temp file\n");
+        return 0;
+    }
     g_ioOk = 0;
     WaitGroup wg;
     for (int i = 0; i < kIoCoros; ++i) Spawn(IoReader(), &wg);
@@ -679,6 +700,10 @@ const char* MainName(MainMode m) { return m == MainMode::InPool ? "inpool" : "ou
 
 void RunOne(const Options& o, const Case& c, Kind kind, std::FILE* csv) {
     c.run(kind);   // warmup
+    if (c.run == &CaseIo && g_ioOpenFailed) {   // skip with a reason rather than print a 0-ops row
+        std::printf("  %-13s skipped (could not open the temp file)\n", c.name);
+        return;
+    }
     if (o.stats) Stats::Reset();
 
     std::vector<double> ms;
@@ -834,6 +859,7 @@ int main(int argc, char** argv) {
     }
 
     if (csv) std::fclose(csv);
+    if (g_checkFailed) std::printf("\nrun FAILED: a correctness check did not hold\n");
     std::fflush(stdout);
-    std::_Exit(0);   // the pool is left running: no teardown to time or to hang on
+    std::_Exit(g_checkFailed ? 1 : 0);   // the pool is left running: no teardown to time or to hang on
 }

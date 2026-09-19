@@ -11,16 +11,16 @@
 #include <atomic>
 #include <cstdint>
 namespace JLib {
-	// Lambda tasks and coroutines run on the worker's stack with no fiber, so neither can block.
+	// Native tasks and coroutines run on the worker's stack with no fiber, so neither can suspend.
 	// Called at every blocking wait:
-	//   lambda    -> abort with a message.
+	//   native    -> abort with a message.
 	//   coroutine -> debug: assert naming the task (it must co_await instead).
 	//                release: nothing; the wait blocks the worker for its duration.
-	[[noreturn]] void LambdaSuspendViolation(const char* where) noexcept;
+	[[noreturn]] void NativeSuspendViolation(const char* where) noexcept;
 	void CoroutineBlockingWait(const Task* t, const char* where) noexcept;
 	inline void CheckSuspendable(const Task* t, const char* where) noexcept {
 		if (!t) return;
-		if (t->lambdaBody) LambdaSuspendViolation(where);
+		if (t->native) NativeSuspendViolation(where);
 		if (t->type == TaskType::Coroutine) CoroutineBlockingWait(t, where);
 	}
 	void CheckSuspendableCurrent(const char* where) noexcept;   // uses the current thread's task

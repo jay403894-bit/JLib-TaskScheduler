@@ -353,22 +353,50 @@ void JLib::BlockOnWaitWord(std::atomic<int>* word) noexcept {
 
 void Thread::Wake() noexcept {
 	// Main never parks on workerState; its wake is a kick of its wait word.
-	if (isMain) { KickWaitWord(&mainWait); return; }
-
-	const int prev = workerState.exchange(WS_NOTIFIED, std::memory_order_seq_cst);
-
-	if (prev != WS_PARKED) return;
-	JLIB_STAT(WakesSent);
-
+	if (isMain) {
+		KickWaitWord(&mainWait);
+	} else if (workerState.exchange(WS_NOTIFIED, std::memory_order_seq_cst) == WS_PARKED) {
+		JLIB_STAT(WakesSent);
 #if defined(JLIB_PLATFORM_WINDOWS)
-	
-	::WakeByAddressSingle(&workerState);
+		::WakeByAddressSingle(&workerState);
 #elif JLIB_PLATFORM_LINUX
-	FutexWakeOne(&workerState);
+		FutexWakeOne(&workerState);
 #else
-	
-	#error "JLib::Scheduler needs WaitOnAddress (Windows) or futex (Linux) -- no other park is supported"
+		#error "JLib::Scheduler needs WaitOnAddress (Windows) or futex (Linux) -- no other park is supported"
 #endif
+	}
+
+	// Blocked in code it cannot suspend: the push this wake announces is for whoever adopted this
+	// thread's inbox. The fence orders the push before the read -- without it a push made just
+	// before the adoption is invisible to the adopter the claim wakes (adopt_model.c,
+	// NO_REDIRECT_FENCE).
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (adoptSlot.load(std::memory_order_seq_cst) == kAdoptAway)
+		scheduler->WakeAdopterOf(qIndex);
+}
+
+bool Thread::DrainAdoptedInbox() {
+	const int q = adoptSlot.load(std::memory_order_seq_cst);
+	if (q < 0) return false;
+	// Announce, then recheck: an owner taking its inbox back clears the adoption first and then
+	// waits out `draining`, so the inbox never has two consumers.
+	draining.store(q, std::memory_order_seq_cst);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	size_t n = 0;
+	if (adoptSlot.load(std::memory_order_seq_cst) == q) {
+		constexpr size_t BATCH = 64;
+		Task* batch[BATCH];
+		TaskMPSCQueue* inbox = scheduler->normalInboxes[(size_t)q].get();
+		while (n < BATCH && inbox->pop(batch[n])) if (batch[n]) ++n;
+		if (n && !scheduler->deques[qIndex]->push_bottom_batch(batch, n)) TaskDeque::FatalPushRefused();
+	}
+	draining.store(kAdoptNone, std::memory_order_seq_cst);
+	return n != 0;
+}
+
+bool Thread::AdoptedInboxHasWork() const {
+	const int q = adoptSlot.load(std::memory_order_seq_cst);
+	return q >= 0 && !scheduler->normalInboxes[(size_t)q]->quiescent();
 }
 
 bool Thread::Ready(){
@@ -397,6 +425,75 @@ void Thread::ReleaseFiber(Fiber* f) {
 	CacheFor(f->stackClass).Push(f);
 }
 
+// ---- spares (Config::spareThreads) ----
+
+void Thread::StartSpare(size_t fiberCacheCapacity) {
+	auto go = std::make_shared<std::atomic<bool>>(false);
+	thread = std::thread([this, go, fiberCacheCapacity]() {
+		while (!go->load(std::memory_order_acquire)) std::this_thread::yield();
+		instance  = this;
+		thread_id = epochId;   // a pool slot of its own, after the workers'
+		detail::RunsGates() = true;
+		JLIB_STAT_ONLY(detail::StatLabelThread(-1, "spare");)
+		running.store(true, std::memory_order_release);
+		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Standard);
+		tinyCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Tiny);
+		deepCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Deep);
+		ready.store(true, std::memory_order_release);
+		SpareLoop();
+	});
+	nativeHandle = thread.native_handle();
+	go->store(true, std::memory_order_release);
+}
+
+void Thread::SpareLoop() {
+	while (running.load(std::memory_order_acquire)) {
+		const int q = adoptSlot.load(std::memory_order_seq_cst);
+		if (q >= 0) {
+			// Announce, recheck, pop ONE, release -- then run. Holding `draining` across the run
+			// would make a returning owner wait out a whole task (adopt_model.c, DRAIN_ACROSS_RUN).
+			draining.store(q, std::memory_order_seq_cst);
+			std::atomic_thread_fence(std::memory_order_seq_cst);
+			Task* t = nullptr;
+			if (adoptSlot.load(std::memory_order_seq_cst) == q)
+				scheduler->normalInboxes[(size_t)q]->pop(t);
+			draining.store(kAdoptNone, std::memory_order_seq_cst);
+			if (t) { RunHelped(t); continue; }
+		}
+
+		// Nothing to run: sweep this thread's retire bag, then park. Same handshake as a worker:
+		// consume a pending kick, publish PARKED, recheck (the adopted inbox is this thread's queue
+		// while adopted -- adopt_model.c NO_PARK_RECHECK), sleep.
+		Reclaimer::Gate(false, false);
+		int e = WS_NOTIFIED;
+		if (workerState.compare_exchange_strong(e, WS_EMPTY, std::memory_order_seq_cst)) continue;
+		e = WS_EMPTY;
+		if (!workerState.compare_exchange_strong(e, WS_PARKED, std::memory_order_seq_cst)) {
+			int n = WS_NOTIFIED;
+			workerState.compare_exchange_strong(n, WS_EMPTY, std::memory_order_seq_cst);
+			continue;
+		}
+		if (!running.load(std::memory_order_seq_cst) || AdoptedInboxHasWork()) {
+			int p = WS_PARKED;
+			if (!workerState.compare_exchange_strong(p, WS_EMPTY, std::memory_order_seq_cst)) {
+				int n = WS_NOTIFIED;
+				workerState.compare_exchange_strong(n, WS_EMPTY, std::memory_order_seq_cst);
+			}
+			continue;
+		}
+		int sleeping = WS_PARKED;
+		while (workerState.load(std::memory_order_seq_cst) == WS_PARKED && running.load(std::memory_order_acquire)) {
+#if defined(JLIB_PLATFORM_WINDOWS)
+			::WaitOnAddress(&workerState, &sleeping, sizeof(int), INFINITE);
+#elif JLIB_PLATFORM_LINUX
+			FutexWait(&workerState, sleeping);
+#endif
+		}
+		int got = WS_NOTIFIED;
+		workerState.compare_exchange_strong(got, WS_EMPTY, std::memory_order_seq_cst);
+	}
+}
+
 // ---- main's helper (MainMode::OutOfPool) ----
 
 void Thread::AdoptAsHelper() {
@@ -414,11 +511,11 @@ bool Thread::HelpSteal() {
 	stealCursor = (stealCursor + 1) % nq;
 	if (!scheduler->DequeHasWork((size_t)stealCursor)) return false;   // flag first, deque second
 	// Mode::Pinned: every suspension must resume on its own thread, and nothing can resume on
-	// main's helper -- so it only takes work that can never suspend (lambdas).
+	// main's helper -- so it only takes work that can never suspend (native tasks).
 	const bool pinned = TaskScheduler::PinForced();
 	auto ok = [pinned](StealBits sb) {
 		if (sb.type == TaskType::Main) return false;
-		return !pinned || sb.lambda;
+		return !pinned || sb.native;
 	};
 	auto s = scheduler->deques[stealCursor]->steal_if(ok);
 	if (!s || !*s) return false;
@@ -426,7 +523,7 @@ bool Thread::HelpSteal() {
 	return true;
 }
 
-// Runs a stolen task on main. Same dispatch as a worker: coroutines and lambdas directly, fibers
+// Runs a stolen task on main. Same dispatch as a worker: coroutines and native tasks directly, fibers
 // on a fiber from the global pool. A task that suspends here resumes elsewhere: nothing is pinned
 // to the helper (Pin::Current resolves to no pin off the pool).
 void Thread::RunHelped(Task* t) {
@@ -443,7 +540,7 @@ void Thread::RunHelped(Task* t) {
 		JLIB_STAT_ONLY(StatRunEnd(t0);)
 		return;
 	}
-	if (t->lambdaBody) {
+	if (t->native) {
 		JLIB_STAT(RunLambda);
 		JLIB_STAT_ONLY(const std::uint64_t t0 = StatRunBegin(t);)
 		t->started = 1;
@@ -598,6 +695,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 	};
 
 	int stealVictim = qIndex;
+	int stickyLeft  = 0;   // passes left on the victim of the last steal (sticky steal cap)
 	// A reserved worker (K) holding a task it stole. Checked once at dispatch, then cleared.
 	bool stolenOnK = false;
 
@@ -726,9 +824,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 				continue;
 			}
 
-			// Lambda: direct call on this stack, no fiber. It may never suspend (asserted at every
-			// wait point). Everything else runs on a fiber.
-			if (task_to_run->lambdaBody) {
+			// Native (lambda or CreateNativeTask): direct call on this stack, no fiber. It may never
+			// suspend (fatal at every wait point). Everything else runs on a fiber.
+			if (task_to_run->native) {
 				currentRunningTask = task_to_run;
 				JLIB_STAT(RunLambda);
 				JLIB_STAT_ONLY(const std::uint64_t t0 = StatRunBegin(task_to_run);)
@@ -860,11 +958,14 @@ bool Thread::Worker(WaitCtx* ctx) {
 				}
 			}
 		}
-		
+
 		drainOwnInbox();
+		// An adopted inbox (its owner is blocked) is one of this worker's queues: moved onto the
+		// deque, it is run from there next pass and stealable meanwhile.
+		if (!task_to_run && !isReservedWorker && DrainAdoptedInbox()) continue;
 
 		{
-			
+
 			// Only hunters scan other deques (K steals under its own rule below).
 			if (!task_to_run && (isSearching || isReservedWorker)) {
 				const bool timeScan = JLIB_STAT_SAMPLE();
@@ -904,12 +1005,27 @@ bool Thread::Worker(WaitCtx* ctx) {
 				const int nq = (int)scheduler->deques.size();
 				if (nq > 1) {
 
-					// One victim per pass; the cursor advances every pass, hit or miss.
-					stealVictim = (stealVictim + 1) % nq;
-					if (stealVictim == qIndex) stealVictim = (stealVictim + 1) % nq;
+					// One victim per pass. The cursor advances every pass, except that after a steal a
+					// compute worker stays on that victim for up to cap-1 more passes (sticky steal);
+					// the first miss there ends it and the cursor moves on next pass.
+					const bool sticking = stickyLeft > 0;
+					if (!sticking) {
+						stealVictim = (stealVictim + 1) % nq;
+						if (stealVictim == qIndex) stealVictim = (stealVictim + 1) % nq;
+					} else {
+						JLIB_STAT(StickyProbes);
+					}
+
+					const bool hit = tryStealFrom(stealVictim);
+					if (hit && !isReservedWorker) {
+						if (sticking) { JLIB_STAT(StickyHits); --stickyLeft; }
+						else          stickyLeft = (int)scheduler->GetStickyStealCap() - 1;
+					} else {
+						stickyLeft = 0;
+					}
 
 					// A compute worker that missed gets one extra probe: its SMT sibling, only if fat.
-					if (!tryStealFrom(stealVictim) && !isReservedWorker) {
+					if (!hit && !isReservedWorker) {
 						const int sib = ((size_t)qIndex < scheduler->siblingQIndex.size())
 						              ? scheduler->siblingQIndex[qIndex] : -1;
 						if (sib >= 0 && sib != stealVictim && sib != qIndex && sib < nq
@@ -922,8 +1038,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 				if (task_to_run) continue;
 			}
 		}
-		
+
 		drainOwnInbox();
+		if (!task_to_run && !isReservedWorker && DrainAdoptedInbox()) continue;
 
 		if (task_to_run) {
 			continue;
@@ -944,6 +1061,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
+						|| (!isReservedWorker && AdoptedInboxHasWork())
 						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
 						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())))) {
 
@@ -1090,6 +1208,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
+						// The adopted inbox is one of this worker's queues while adopted -- load-
+						// bearing, not a courtesy (adopt_model.c: NO_PARK_RECHECK loses a wake).
+						|| (!isReservedWorker && AdoptedInboxHasWork())
 						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
 						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())
 						// Nobody is hunting any more. This worker left the hunt BEFORE it was on

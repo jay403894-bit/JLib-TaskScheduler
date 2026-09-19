@@ -179,6 +179,42 @@ jobs:
           # The deep pass: ~1.4 M executions, ~12 min single-threaded locally (GenMC 0.18).
           must_pass $M
 
+      # Inbox adoption (BlockInPlace): a blocked thread's inbox drained by a worker or a spare.
+      - name: GenMC adoption model (safety + liveness)
+        run: |
+          docker pull genmc/genmc:v0.17.0
+          M=tests/verify/adopt_model.c
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc --disable-estimation --check-liveness -- "$@" > genmc.out 2>&1
+          }
+          must_pass() {
+            echo "=== $* (expect: no errors) ==="
+            if ! run_genmc "$@"; then tail -30 genmc.out; exit 1; fi
+            grep -m1 'complete executions' genmc.out
+          }
+          must_fail() {
+            echo "=== $* (expect: violation) ==="
+            run_genmc "$@" || true
+            if grep -qE 'INTERNAL|Unknown command line|Error opening' genmc.out || ! grep -qE 'violation' genmc.out; then
+              echo "NEGATIVE CONTROL DID NOT REPORT A VIOLATION: $*"; tail -30 genmc.out; exit 1
+            fi
+            grep -m1 -E 'violation' genmc.out
+          }
+          for V in "" "-DSPARE"; do
+            must_pass $V $M
+            must_pass $V -DPUSHES=2 $M
+            must_pass $V -DRETURNS $M
+            must_pass $V -DRETURNS -DPUSHES=2 $M
+          done
+          must_pass -DTWO_BLOCKERS $M
+          must_fail -DNO_WAKE_REDIRECT $M
+          must_fail -DNO_REDIRECT_FENCE $M
+          must_fail -DNO_PARK_RECHECK -DPUSHES=2 $M
+          must_fail -DRETURNS -DNO_DRAIN_RECHECK $M
+          must_fail -DTWO_BLOCKERS -DEXCHANGE_CLAIM $M
+          must_fail -DSPARE -DRETURNS -DDRAIN_ACROSS_RUN $M
+
       # Linden-Jonsson priority queue (extras/wip/SkipListPQ.h). Same must-report rule as above;
       # PAPER_OBSHEAD shows up as an access past the list rather than an assert.
       - name: GenMC skiplist priority queue model

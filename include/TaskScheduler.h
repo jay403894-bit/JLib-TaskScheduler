@@ -141,6 +141,33 @@ namespace JLib {
 		// MainMode::InPool only: wake main out of a WaitFor so it re-checks its predicate.
 		static void WakeMain() noexcept;
 
+		// Called on a pool thread (main in the pool included) about to block in code it cannot
+		// suspend: a third-party library, a driver call, Present with vsync, a sleep. Its normal
+		// inbox is adopted by a free compute worker, which drains it until BlockEnd, so nothing
+		// pushed to this thread waits for it; its deque was always stealable. Pinned and main-only
+		// work (the hi-pri inbox) still waits -- only this thread may run it. Blocking inside an
+		// EpochGuard is fatal (it would stall reclamation for everyone). Nests; a no-op off the
+		// pool. If no worker is free to adopt (at most half the pool can be adopted at once) the
+		// inbox is moved onto the deque once and later pushes wait. Model: tests/verify/adopt_model.c.
+		static void BlockBegin();
+		static void BlockEnd();
+		template <typename F>
+		static decltype(auto) BlockInPlace(F&& f) {
+			BlockBegin();
+			struct End { ~End() { BlockEnd(); } } end;
+			return f();
+		}
+		// The same for main, kept by name.
+		static void MainAwayBegin() { BlockBegin(); }
+		static void MainAwayEnd()   { BlockEnd(); }
+		class MainAway {
+		public:
+			MainAway()  { MainAwayBegin(); }
+			~MainAway() { MainAwayEnd(); }
+			MainAway(const MainAway&) = delete;
+			MainAway& operator=(const MainAway&) = delete;
+		};
+
 		static constexpr size_t kNoIdleWorker = ~(size_t)0;
 
 		static constexpr size_t kAnyWorker = ~(size_t)0;
@@ -157,11 +184,33 @@ namespace JLib {
 		enum class PowerThrottling : uint8_t { Topology = 0, OptOut, SystemManaged, Force };
 		static PowerThrottling GetWorkerPowerThrottling();
 
+		// How ParallelFor spreads a range (after the width/grain front end).
+		//   Cursor:    one shared cursor, each helper claims a grain at a time. Best for compute
+		//              bodies with pieces of ~1-30 us.
+		//   LazyPCore: one contiguous range per P-core, then lazy binary splitting through the
+		//              workers' own deques (E-cores join by stealing halves). Best for tiny pieces,
+		//              where the shared cursor contends, and for memory-bound bodies at any size
+		//              (each thread streams a contiguous range). Main out of the pool splits onto
+		//              the non-worker deque (push-only).
+		//   Auto:      LazyPCore when the probed cost of a piece is under 0.5 us, else Cursor
+		//              (Cursor when there is no probe: measuredWidth off). It cannot tell a
+		//              memory-bound body; pass LazyPCore per call for those.
+		enum class PforMode : uint8_t { Cursor = 0, LazyPCore = 1, Auto = 2 };
+
 		void ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func);
+		// The same with this call's PforMode instead of the pool's (e.g. LazyPCore for a
+		// memory-bound body, which Auto cannot detect).
+		void ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func, PforMode mode);
 
 		void ParallelFor(int begin, int end, std::function<void(int, int)> func);
 		
 		void RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func);
+		// PforMode::LazyPCore. Hands one contiguous range to each P-core (idle ones by their normal
+		// inbox; busy ones' shares go on the caller's own deque instead, stealable at once), then the
+		// caller and every piece run grain by grain and, while their own deque is empty, push the
+		// upper half there for a thief.
+		void RunLazyRange(int start, int end, int grain, std::function<void(int, int)>& func, size_t width);
+		void RunLazyPiece(std::function<void(int, int)>* func, int lo, int hi, int grain, WaitGroup* wg);
 
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg, Pin pin = Pin::None);
@@ -171,6 +220,10 @@ namespace JLib {
 		bool WaitFor(WaitGroup* wg, bool (*pred)(void*), void* arg, Pin pin = Pin::None);
 
 		bool PushTo(size_t worker, Task* task);
+		// Round-robin over the compute workers of one core class, skipping main and threads that
+		// are away. hiPri: that worker's hi-pri inbox (never stolen); otherwise its normal inbox,
+		// which it drains to its deque, where the work can be stolen.
+		bool PushTo(Task* task, CorePref pref = CorePref::P, bool hiPri = true);
 
 		bool PushIO(Task* task) noexcept;
 
@@ -286,6 +339,12 @@ namespace JLib {
 		// Settable while the pool runs (the Set* instance methods below). Each Init starts from the
 		// values in its Config; nothing carries over from an earlier pool.
 		struct Tunables {
+			PforMode pforMode          = PforMode::Auto;
+			// A hunter that stole from a victim tries the same victim again on its next pass, up to
+			// this many steals in a row; a miss (or the victim's flag clear) ends it. 1 = off.
+			// Clamped to 1..8. K never sticks. Measured best at 8 for single- and multi-producer
+			// fan-out (and it narrows the gap between producers); neutral on fork trees and pfor.
+			unsigned stickyStealCap    = 8;
 			size_t   minItersPerWorker = 64;
 			size_t   leavesPerWorker   = 8;
 			bool     measuredWidth     = true;
@@ -316,6 +375,14 @@ namespace JLib {
 			SlabSizes       slab;
 			bool            slabGrowth   = true;
 			bool            lazyTaskSlab = false;
+			// Epoch slots for threads outside the pool (ThreadScope), reserved at Init. Only
+			// claimed slots cost anything: an idle one never holds back reclamation.
+			size_t          externalThreads = 16;
+			// Parked OS threads that stand in for a thread blocked in BlockInPlace: a spare adopts
+			// its inbox before any worker does, so the pool keeps its full width while the call
+			// blocks (e.g. Present with vsync every frame). 0 = adoption by workers only, no extra
+			// threads. Not used in Mode::Pinned (a spare is not a slot; nothing can pin to it).
+			size_t          spareThreads = 0;
 			Tunables        tunables;
 		};
 
@@ -338,6 +405,10 @@ namespace JLib {
 		unsigned GetWakeCostNs() const noexcept;
 		void     SetParallelForSerial(bool on) noexcept;
 		bool     ParallelForSerial() const noexcept;
+		void     SetPforMode(PforMode m) noexcept;
+		PforMode GetPforMode() const noexcept;
+		void     SetStickyStealCap(unsigned n) noexcept;
+		unsigned GetStickyStealCap() const noexcept;
 		void     SetIoQuietWindowUs(unsigned us) noexcept;
 		unsigned IoQuietWindowUs() const noexcept;
 		void     SetReservedStealing(bool on) noexcept;
@@ -455,6 +526,15 @@ namespace JLib {
 			return CreateTaskImpl(fn, data, lane, type, stack);
 		}
 
+		// A native task: fn(data) is called on the worker's own stack, no fiber is checked out. It
+		// must not suspend (WaitFor, SchedulerMutex, ... are fatal inside it); it may block the OS
+		// thread only inside BlockInPlace, which hands its inbox to another thread meanwhile.
+		Task* CreateNativeTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal) {
+			Task* t = CreateTaskImpl(fn, data, lane, TaskType::Fiber);
+			if (t) t->native = 1;
+			return t;
+		}
+
 		Task* CreateInternalTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal,
 		                         StackClass stack = StackClass::Standard) {
 			return CreateTaskImpl(fn, data, lane, TaskType::Fiber, stack);
@@ -462,7 +542,7 @@ namespace JLib {
 
 		template<typename F>
 		auto CreateTask(F&& f, Lane lane = Lane::Normal, StackClass stack = StackClass::Standard) {
-			constexpr TaskType type = TaskType::Fiber;   // may run on a fiber, must not suspend (lambdaBody)
+			constexpr TaskType type = TaskType::Fiber;   // may run on a fiber, must not suspend (native)
 			using L = LambdaTask<std::decay_t<F>>;
 			
 			detail::RecordTaskSize(sizeof(L));
@@ -559,6 +639,9 @@ namespace JLib {
 		
 		bool PushTarget(Task* task, size_t worker = kAnyWorker);
 
+		// Wakes whichever worker has adopted queue q's inbox (Thread::Wake, when q is away).
+		void WakeAdopterOf(int q) noexcept;
+
 		void MaybeBuddyWake(size_t k) noexcept;
 		
 		int PickNextWorker(Lane lane = Lane::Normal);
@@ -592,6 +675,8 @@ namespace JLib {
 			std::atomic<bool>     rememberedCost;
 			std::atomic<unsigned> wakeCostNs;
 			std::atomic<bool>     parallelForSerial;
+			std::atomic<uint8_t>  pforMode;
+			std::atomic<unsigned> stickyStealCap;
 			std::atomic<unsigned> ioQuietWindowUs;
 			std::atomic<bool>     reservedStealing;
 			std::atomic<bool>     laneIntake;
@@ -655,6 +740,7 @@ namespace JLib {
 		std::atomic<int> nextWorker{ 0 };
 		
 		std::atomic<size_t> nextHotWorker{ 0 };
+		std::atomic<size_t> nextClassWorker[2]{};   // PushTo(CorePref) round-robin: P, E
 		
 		std::vector<int> pWorkers, eWorkers;
 		std::atomic<size_t> nextPWorker{ 0 }, nextEWorker{ 0 };
@@ -663,11 +749,35 @@ namespace JLib {
 		std::vector<Thread*> workers;
 		// MainMode::OutOfPool: main's helper Thread (not in workers; see Thread::isHelper).
 		Thread* mainHelper = nullptr;
+		// Config::spareThreads: parked stand-ins for a thread blocked in BlockInPlace (Thread::isSpare).
+		std::vector<Thread*> spares;
 		TaskMPSCQueue mainQ;
 		std::mutex poolMutex;
 	};
 
 	using SchedulerConfig = TaskScheduler::Config;
+
+	// Gives a thread outside the pool what pool threads have: an epoch slot (EpochGuard, RetirePtr
+	// and the lock-free structures work), a hazard reader row, and its own retire bag. Put one at
+	// the top of the thread's body, after Init:
+	//
+	//     std::thread([] { JLib::ThreadScope scope; /* ... use the data structures ... */ });
+	//
+	// Nests, and is a no-op on main or a pool thread (they already have a slot). Ending the scope
+	// while an EpochGuard is open on the thread is fatal. What its bag still holds goes to the
+	// shared orphan store, which the pool sweeps. Config::externalThreads sets how many threads
+	// can hold a scope at once.
+	class ThreadScope {
+	public:
+		ThreadScope();
+		~ThreadScope();
+		ThreadScope(const ThreadScope&) = delete;
+		ThreadScope& operator=(const ThreadScope&) = delete;
+		size_t Slot() const noexcept { return slot_; }
+	private:
+		size_t slot_  = kNoThreadSlot;
+		bool   owner_ = false;   // false: the thread already had a slot, nothing to undo
+	};
 
 	inline bool IsTaskCancelled(const Task* t) {
 		if (!t) return false;

@@ -10,13 +10,14 @@
 #include <algorithm>
 
 #include "Task.h"
-#include "platform.h"   
+#include "platform.h"
+#include "Stats.h"      // JLIB_STAT (empty unless JLIBSCHED_STATS)
 
 namespace JLib {
 
     struct StealBits {
         TaskType type;
-        bool     lambda;   // a lambda task: runs directly and can never suspend
+        bool     native;   // a native task (fn+ctx or lambda): runs on the worker stack, never suspends
     };
 
     class alignas(platform::kCacheLine) TaskDeque {
@@ -59,6 +60,19 @@ namespace JLib {
             ownerLane_  = lane;
         }
 
+        // The owner only pushes; work leaves by steal alone (the non-worker deque: main out of the
+        // pool splits ParallelFor ranges onto it). pop_bottom on it is fatal.
+        void SetPushOnly() noexcept { pushOnly_ = true; }
+
+        [[noreturn]] static void FatalPopOnPushOnly(size_t owner) {
+            std::fprintf(stderr,
+                "[JLib::Scheduler] FATAL: pop_bottom on push-only deque %zu.\n"
+                "  Its owner promised never to take from the bottom; tasks leave it only by steal.\n"
+                "  Something now drains it as if it were a worker's own deque.\n", owner);
+            std::fflush(nullptr);
+            std::abort();
+        }
+
         // "This deque may have work", kept in memory OWNED BY NOBODY ELSE'S DEQUE (see the flag
         // array in TaskScheduler). A thief reads the flag instead of this deque's top_/bottom_, so
         // scanning does not pull the owner's hot lines away from it. Only the owner writes it --
@@ -71,12 +85,16 @@ namespace JLib {
         void SetWorkFlag(std::atomic<std::uint8_t>* flag) noexcept { workFlag_ = flag; }
 
         void MarkHasWork() noexcept {
-            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) == 0)
+            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) == 0) {
                 workFlag_->store(1, std::memory_order_relaxed);
+                JLIB_STAT(WorkFlagWrites);
+            }
         }
         void MarkEmpty() noexcept {
-            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) != 0)
+            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) != 0) {
                 workFlag_->store(0, std::memory_order_relaxed);
+                JLIB_STAT(WorkFlagWrites);
+            }
         }
 
         static Ring* MakeRing(size_t capacity) {
@@ -164,8 +182,8 @@ namespace JLib {
 
         static uintptr_t tag(Task* item) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(item);
-            // Type code 3 (unused by TaskType) marks a lambda task, which is TaskType::Fiber.
-            const uintptr_t code = item->lambdaBody ? 3u : (static_cast<uintptr_t>(item->type) & 0x3);
+            // Type code 3 (unused by TaskType) marks a native task (lambda or CreateNativeTask).
+            const uintptr_t code = item->native ? 3u : (static_cast<uintptr_t>(item->type) & 0x3);
             return p | code;
         }
         static Task* untag(uintptr_t v) {
@@ -220,6 +238,7 @@ namespace JLib {
         }
 
         std::optional<Task*> pop_bottom() {
+            if (pushOnly_) FatalPopOnPushOnly(ownerIndex_);
             size_t b = bottom_.load(std::memory_order_relaxed);
             size_t t = top_.load(std::memory_order_acquire);
 
@@ -337,6 +356,7 @@ namespace JLib {
 
         size_t      ownerIndex_ = SIZE_MAX;
         const char* ownerLane_  = "untagged";
+        bool        pushOnly_   = false;   // SetPushOnly; set before publication, never cleared
         std::atomic<std::uint8_t>* workFlag_ = nullptr;   // lives in the scheduler's flag array
 
         alignas(platform::kCacheLine) std::atomic<size_t> top_;

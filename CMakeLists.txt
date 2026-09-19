@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-set(JLIBSCHED_VERSION "1.0.0")
+set(JLIBSCHED_VERSION "1.1.0")
 
 option(JLIBSCHED_STATS "Per-thread scheduler counters and timing histograms (diagnostic build)" OFF)
 option(JLIBSCHED_RETRY_STATS "Record CAS retries per call -- max and buckets, not an average (diagnostic; sits inside CAS loops)" OFF)
@@ -344,6 +344,9 @@ set(JLIBSCHED_TESTS
     SchedulerSlabExitTest     tests/slab_thread_exit_test.cpp
     SchedulerDagUnsubmittedTest tests/dag_unsubmitted_test.cpp
     SchedulerSkipListPqTest   tests/skiplist_pq_test.cpp
+    SchedulerMainAwayTest     tests/main_away_test.cpp
+    SchedulerThreadScopeTest  tests/thread_scope_test.cpp
+    SchedulerBlockInPlaceTest tests/block_in_place_test.cpp
     SchedulerFiberGrowTest    tests/fiber_grow_test.cpp
     SchedulerFtlTest          tests/ftl_test.cpp
     SchedulerHangHuntTest     tests/hang_hunt_test.cpp
@@ -353,6 +356,7 @@ set(JLIBSCHED_TESTS
     SchedulerMainPushToTest   tests/main_pushto_test.cpp
     SchedulerPeriodicTest     tests/periodic_test.cpp
     SchedulerPforAllocTest    tests/pfor_alloc_test.cpp
+    SchedulerPforModeTest     tests/pfor_mode_test.cpp
     SchedulerPinTest          tests/pin_test.cpp
     SchedulerReclaimTest      tests/reclaim_test.cpp
     SchedulerRecordTest       tests/record_test.cpp

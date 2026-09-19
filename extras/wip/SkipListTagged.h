@@ -10,15 +10,15 @@
 //   - seq_cst fences on both sides of the "linked at level L" / "marked at level 0" handoff
 //     (store-buffering shape), so either the remover's find sees the link or the inserter sees
 //     the mark and cleans up itself.
-//   - Node allocated once per add, not once per retry; xorshift + countr_zero for levels.
+//   - Node allocated once per add, not once per retry; xorshift + trailing zeros for levels.
 //   - UINT64_MAX is reserved for the tail sentinel.
 
 #include <atomic>
-#include <bit>
 #include <cstdint>
 #include <cstddef>
 #include <utility>
 #include "Epochs.h"
+#include "Thread.h"   // EpochGuard
 
 namespace JLib {
 
@@ -70,7 +70,11 @@ namespace JLib {
         static int randomLevel() noexcept {
             static thread_local uint64_t s = mix(reinterpret_cast<uintptr_t>(&s) ^ 0x9E3779B97F4A7C15ull);
             s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            return std::countr_zero(s | (uint64_t(1) << (kMaxLevel - 1)));
+            // Trailing zeros, capped at kMaxLevel-1 by the guard bit (C++17: no std::countr_zero).
+            uint64_t x = s | (uint64_t(1) << (kMaxLevel - 1));
+            int level = 0;
+            while (!(x & 1)) { x >>= 1; ++level; }
+            return level;
         }
 
         static void release(Node* n) noexcept {

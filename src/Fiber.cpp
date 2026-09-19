@@ -9,11 +9,12 @@
 #include <cstdlib>
 using namespace JLib;
 
-void JLib::LambdaSuspendViolation(const char* where) noexcept {
+void JLib::NativeSuspendViolation(const char* where) noexcept {
 	std::fprintf(stderr,
-		"[JLib::Scheduler] FATAL: a lambda task tried to suspend (%s).\n"
-		"  Lambda tasks may run on a fiber but must not block, wait or yield. Use the raw\n"
-		"  CreateTask(void(*)(void*), void* ctx, ...) overload for work that suspends.\n", where);
+		"[JLib::Scheduler] FATAL: a native task tried to suspend (%s).\n"
+		"  Native tasks (every lambda task, and CreateNativeTask) run on the worker's stack and\n"
+		"  must not wait or yield. Block the OS thread inside TaskScheduler::BlockInPlace, or use\n"
+		"  CreateTask(void(*)(void*), void* ctx, ...) for work that suspends.\n", where);
 	std::fflush(stderr);
 	std::abort();
 }

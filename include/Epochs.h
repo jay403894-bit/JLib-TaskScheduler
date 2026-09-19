@@ -3,6 +3,7 @@
 
 #pragma once
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -28,6 +29,8 @@ namespace JLib {
 	struct PeriodicTask;
 	extern thread_local size_t thread_id;   // written by the pool; read through CurrentThreadId()
 	JLIB_NOINLINE size_t CurrentThreadId() noexcept;
+	// thread_id of a thread with no epoch slot: not main, not a pool thread, no ThreadScope.
+	inline constexpr size_t kNoThreadSlot = SIZE_MAX;
 
 	namespace detail {
 		struct EpochRetired {
@@ -104,6 +107,10 @@ namespace JLib {
 		};
 		std::vector<ThreadEpoch*> threadEpochs;
 
+		size_t externalBase_  = 0;
+		size_t externalCount_ = 0;
+		std::unique_ptr<std::atomic<bool>[]> externalClaimed_;
+
 		EpochManager() = default;
 	public:
 		EpochManager(const EpochManager&) = delete;
@@ -137,8 +144,17 @@ namespace JLib {
 #endif
 		}
 	
-		void Init(size_t maxThreads)
+		// poolSlots: main + workers (ids 0..poolSlots-1). externalSlots: ids after them, claimed and
+		// released by ThreadScope; idle ones read as SIZE_MAX and never hold back reclamation.
+		void Init(size_t poolSlots, size_t externalSlots = 0)
 		{
+			const size_t maxThreads = poolSlots + externalSlots;
+			externalBase_  = poolSlots;
+			externalCount_ = externalSlots;
+			externalClaimed_.reset(externalSlots ? new std::atomic<bool>[externalSlots] : nullptr);
+			for (size_t i = 0; i < externalSlots; ++i)
+				externalClaimed_[i].store(false, std::memory_order_relaxed);
+
 			const size_t had = threadEpochs.size();
 			if (maxThreads > had) {
 				threadEpochs.resize(maxThreads);
@@ -153,8 +169,26 @@ namespace JLib {
 			}
 		}
 		
+		// A free external slot's id, or kNoThreadSlot if all are taken.
+		size_t ClaimExternalSlot() noexcept {
+			for (size_t i = 0; i < externalCount_; ++i) {
+				bool expected = false;
+				if (externalClaimed_[i].compare_exchange_strong(expected, true,
+						std::memory_order_acq_rel, std::memory_order_relaxed))
+					return externalBase_ + i;
+			}
+			return kNoThreadSlot;
+		}
+		void ReleaseExternalSlot(size_t tid) noexcept {
+			if (tid >= externalBase_ && tid - externalBase_ < externalCount_)
+				externalClaimed_[tid - externalBase_].store(false, std::memory_order_release);
+		}
+		size_t ExternalSlotCount() const noexcept { return externalCount_; }
+
+		// nullptr for a thread with no slot (kNoThreadSlot).
 		std::atomic<size_t>* ThreadSlot(size_t tid) {
-			
+			if (tid == kNoThreadSlot) return nullptr;
+
 #if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
 			if (tid >= threadEpochs.size()) {
 				std::fprintf(stderr,
