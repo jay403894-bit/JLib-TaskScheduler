@@ -34,6 +34,7 @@ for i in $(seq 1 "$LOOPS"); do
     run SchedulerBlockInPlaceTest s0
     run SchedulerPforModeTest i
     run SchedulerPforModeTest o
+    run SchedulerInboxFairnessTest x
     run SchedulerLateFreeTest x
     run SchedulerMainHelpTest x
     run SchedulerMainPushToTest x

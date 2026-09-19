@@ -236,6 +236,11 @@ namespace JLib {
 		static bool  PushLaneIntake(Task** tasks, size_t n) noexcept;
 		static Task* TakeLaneIntake() noexcept;
 		static bool  LaneIntakeIdle() noexcept;
+
+		// Every kFairTickEvery-th pass a compute worker drains its inbox even when its own deque is
+		// not empty (normally the inbox waits for the deque to run dry), so a worker whose work keeps
+		// pushing its successor cannot ignore its inbox forever. Go's global-queue fairness tick.
+		static constexpr unsigned kFairTickEvery = 61;
 		
 		enum class RequeueResult { Failed, Pinned, Stealable };
 		RequeueResult Requeue(Task* task);
@@ -345,6 +350,11 @@ namespace JLib {
 			// Clamped to 1..8. K never sticks. Measured best at 8 for single- and multi-producer
 			// fan-out (and it narrows the gap between producers); neutral on fork trees and pfor.
 			unsigned stickyStealCap    = 8;
+			// When a hunter's cursor probe misses, seek: read the work flags (own L3 group) into a
+			// mask and steal from one picked by a per-thread rotation, so thieves spread instead
+			// of piling onto the lowest index. Not sticky -- the next miss seeks again.
+			// Single-producer fan-out -35..-47%, multi-producer -2..-6%, else neutral. K never.
+			bool     seekOnMiss        = true;
 			size_t   minItersPerWorker = 64;
 			size_t   leavesPerWorker   = 8;
 			bool     measuredWidth     = true;
@@ -363,7 +373,12 @@ namespace JLib {
 			Mode            mode      = Mode::Migrate;
 			MainMode        main      = MainMode::Default;
 			size_t          workers   = 0;          // 0 = GetSafeTC()
-			size_t          hotWorkers = 0;         // K; at least 1 when io is on
+			// K; at least 1 when io is on. Reserved workers for the latency lane (latency-lane tasks
+			// and latency I/O completions). K never parks: each keeps a core awake (backing off when
+			// idle) at high priority, for microsecond pickup even with every compute worker busy;
+			// when its lane is empty it steals compute. With K = 0 latency tasks are placed as
+			// normal work.
+			size_t          hotWorkers = 0;
 			AffinityPolicy  affinity  = AffinityPolicy::Ideal;
 			PowerThrottling power     = PowerThrottling::OptOut;
 			unsigned        reservedCores = 0;
@@ -409,6 +424,8 @@ namespace JLib {
 		PforMode GetPforMode() const noexcept;
 		void     SetStickyStealCap(unsigned n) noexcept;
 		unsigned GetStickyStealCap() const noexcept;
+		void     SetSeekOnMiss(bool on) noexcept;
+		bool     SeekOnMiss() const noexcept;
 		void     SetIoQuietWindowUs(unsigned us) noexcept;
 		unsigned IoQuietWindowUs() const noexcept;
 		void     SetReservedStealing(bool on) noexcept;
@@ -601,6 +618,11 @@ namespace JLib {
 		// sharing happens when nobody is reading, and the whole array is ONE FETCH when nobody is
 		// writing. Padding would trade that single fetch for one per worker -- the cost this
 		// exists to remove.
+		//
+		// Packed PER L3, though: with several L3s (multi-CCD, multi-socket) each L3 group's flags
+		// get cache lines of their own, so an owner's flip invalidates only its own group's line
+		// instead of bouncing one line across every L3. With one L3 the layout is the plain packed
+		// array. flagSlot[q] is deque q's byte.
 		struct FlagsDeleter {
 			void operator()(std::atomic<std::uint8_t>* p) const noexcept {
 				::operator delete(p, std::align_val_t(platform::kCacheLine));
@@ -608,9 +630,22 @@ namespace JLib {
 		};
 		std::unique_ptr<std::atomic<std::uint8_t>[], FlagsDeleter> workFlags;
 
+		std::vector<uint32_t> flagSlot;
+		bool flagsGrouped = false;   // false: one L3, flag q is byte q (no flagSlot load)
+
 		bool DequeHasWork(size_t q) const noexcept {
-			return workFlags && workFlags[q].load(std::memory_order_relaxed) != 0;
+			return workFlags
+			    && workFlags[flagsGrouped ? flagSlot[q] : q].load(std::memory_order_relaxed) != 0;
 		}
+
+		// L3 groups over deques (workers, then the non-worker deque, which joins worker 0's group).
+		// One group on a single-L3 machine. JLIBSCHED_FORCE_L3_GROUPS=n in the environment splits
+		// the compute workers into n contiguous groups instead (testing the multi-L3 paths on one L3).
+		size_t l3Groups = 1;
+		std::vector<uint16_t> l3GroupOf;                 // per deque
+		std::vector<std::vector<int>> l3Members;         // per group: its deques
+		std::vector<std::vector<int>> l3Others;          // per group: every deque outside it
+		void BuildL3Groups(size_t numDeques);
 
 		size_t nonWorkerLane = 0;
 		std::atomic<bool> nonWorkerLaneClaimed{ false };
@@ -620,6 +655,10 @@ namespace JLib {
 		std::vector<std::unique_ptr<TaskMPSCQueue>> normalInboxes;
 		
 		moodycamel::ConcurrentQueue<Task*> laneIntake;
+		// Tasks in laneIntake, kept beside it so the per-pass "anything there?" check is one load of
+		// a line written only when latency work arrives or leaves. Signed: a taker can decrement
+		// before the pusher's increment lands, which reads as "nothing yet" for an instant.
+		alignas(platform::kCacheLine) std::atomic<long long> laneIntakeCount_{ 0 };
 
 		// Direct-run inboxes: popped and run by their owner only, never moved to a deque, never
 		// stolen. Hi-pri lane work and pinned resumes both land here.
@@ -677,6 +716,7 @@ namespace JLib {
 			std::atomic<bool>     parallelForSerial;
 			std::atomic<uint8_t>  pforMode;
 			std::atomic<unsigned> stickyStealCap;
+			std::atomic<bool>     seekOnMiss;
 			std::atomic<unsigned> ioQuietWindowUs;
 			std::atomic<bool>     reservedStealing;
 			std::atomic<bool>     laneIntake;

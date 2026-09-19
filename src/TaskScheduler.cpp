@@ -128,6 +128,7 @@ TaskScheduler::LiveTunables::LiveTunables(const Tunables& t) noexcept
 	, parallelForSerial(t.parallelForSerial)
 	, pforMode((uint8_t)t.pforMode)
 	, stickyStealCap(t.stickyStealCap < 1 ? 1 : (t.stickyStealCap > 8 ? 8 : t.stickyStealCap))
+	, seekOnMiss(t.seekOnMiss)
 	, ioQuietWindowUs(t.ioQuietWindowUs)
 	, reservedStealing(t.reservedStealing)
 	, laneIntake(t.laneIntake)
@@ -860,6 +861,8 @@ void     TaskScheduler::SetPforMode(PforMode m) noexcept        { live_.pforMode
 TaskScheduler::PforMode TaskScheduler::GetPforMode() const noexcept { return (PforMode)live_.pforMode.load(std::memory_order_relaxed); }
 void     TaskScheduler::SetStickyStealCap(unsigned n) noexcept  { live_.stickyStealCap.store(n < 1 ? 1 : (n > 8 ? 8 : n), std::memory_order_relaxed); }
 unsigned TaskScheduler::GetStickyStealCap() const noexcept     { return live_.stickyStealCap.load(std::memory_order_relaxed); }
+void     TaskScheduler::SetSeekOnMiss(bool on) noexcept         { live_.seekOnMiss.store(on, std::memory_order_relaxed); }
+bool     TaskScheduler::SeekOnMiss() const noexcept            { return live_.seekOnMiss.load(std::memory_order_relaxed); }
 void     TaskScheduler::SetIoQuietWindowUs(unsigned us) noexcept { live_.ioQuietWindowUs.store(us, std::memory_order_relaxed); }
 unsigned TaskScheduler::IoQuietWindowUs() const noexcept       { return live_.ioQuietWindowUs.load(std::memory_order_relaxed); }
 void     TaskScheduler::SetReservedStealing(bool on) noexcept   { live_.reservedStealing.store(on, std::memory_order_relaxed); }
@@ -1319,6 +1322,48 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 			((isPCore[m] == isPCore[q]) ? matesSameClass[q] : matesOtherClass[q]).push_back(m);
 }
 
+void TaskScheduler::BuildL3Groups(size_t numDeques) {
+	const size_t nw = llcMaskOfWorker.size();   // workers; deque nw (if any) is the non-worker deque
+	l3GroupOf.assign(numDeques, 0);
+
+	size_t forced = 0;
+	{
+		char buf[16] = {};
+#if defined(_MSC_VER)
+		size_t elen = 0; char* ev = nullptr;
+		if (_dupenv_s(&ev, &elen, "JLIBSCHED_FORCE_L3_GROUPS") == 0 && ev) { strncpy_s(buf, sizeof(buf), ev, _TRUNCATE); free(ev); }
+#else
+		if (const char* ev = std::getenv("JLIBSCHED_FORCE_L3_GROUPS")) { std::strncpy(buf, ev, sizeof(buf) - 1); }
+#endif
+		forced = buf[0] ? (size_t)std::strtoul(buf, nullptr, 10) : 0;
+	}
+
+	if (forced >= 2 && nw >= forced) {
+		for (size_t q = 0; q < nw; ++q) l3GroupOf[q] = (uint16_t)(q * forced / nw);
+	} else {
+		// Distinct LLC masks; a worker with none (no cache info) goes with group 0.
+		std::vector<topology::CpuMask> seen;
+		for (size_t q = 0; q < nw; ++q) {
+			const topology::CpuMask& m = llcMaskOfWorker[q];
+			if (!m.Any()) continue;
+			size_t g = 0;
+			while (g < seen.size() && !(seen[g] == m)) ++g;
+			if (g == seen.size()) seen.push_back(m);
+			l3GroupOf[q] = (uint16_t)g;
+		}
+	}
+	for (size_t d = nw; d < numDeques; ++d) l3GroupOf[d] = nw ? l3GroupOf[0] : 0;   // non-worker deque
+
+	l3Groups = 1;
+	for (size_t d = 0; d < numDeques; ++d) l3Groups = std::max<size_t>(l3Groups, (size_t)l3GroupOf[d] + 1);
+	l3Members.assign(l3Groups, {});
+	l3Others.assign(l3Groups, {});
+	for (size_t d = 0; d < numDeques; ++d) l3Members[l3GroupOf[d]].push_back((int)d);
+	for (size_t g = 0; g < l3Groups; ++g)
+		for (size_t d = 0; d < numDeques; ++d)
+			if (l3GroupOf[d] != g) l3Others[g].push_back((int)d);
+}
+
 void TaskScheduler::StartPool(size_t poolSize) {
 	poolMutex.lock();
 	thread_id = 0;   // main always owns epoch slot 0; workers get 1..N below
@@ -1441,15 +1486,26 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	}
 	nonWorkerLaneClaimed.store(false, std::memory_order_relaxed);
 
-	// One byte per deque, packed into a cache-line-aligned block so a hunter's pass reads them all
-	// in one fetch, and handed to each deque now that the count is final.
+	// One byte per deque, packed per L3 group: each group starts on a cache line of its own, so a
+	// hunter's pass over its own group is one fetch and an owner's flip stays inside its L3. With
+	// one group this is the plain packed array. Handed to each deque now that the count is final.
 	{
 		const size_t n = deques.size();
+		BuildL3Groups(n);
+		constexpr size_t kLine = platform::kCacheLine;
+		flagSlot.assign(n, 0);
+		size_t total = 0;
+		for (size_t g = 0; g < l3Groups; ++g) {
+			for (size_t i = 0; i < l3Members[g].size(); ++i) flagSlot[(size_t)l3Members[g][i]] = (uint32_t)(total + i);
+			total += (l3Groups == 1) ? l3Members[g].size() : (l3Members[g].size() + kLine - 1) / kLine * kLine;
+		}
+		if (total == 0) total = 1;
 		auto* mem = static_cast<std::atomic<std::uint8_t>*>(
-			::operator new(n * sizeof(std::atomic<std::uint8_t>), std::align_val_t(platform::kCacheLine)));
-		for (size_t i = 0; i < n; ++i) ::new (&mem[i]) std::atomic<std::uint8_t>(0);
+			::operator new(total * sizeof(std::atomic<std::uint8_t>), std::align_val_t(kLine)));
+		for (size_t i = 0; i < total; ++i) ::new (&mem[i]) std::atomic<std::uint8_t>(0);
 		workFlags.reset(mem);
-		for (size_t i = 0; i < n; ++i) deques[i]->SetWorkFlag(&workFlags[i]);
+		flagsGrouped = l3Groups > 1;
+		for (size_t i = 0; i < n; ++i) deques[i]->SetWorkFlag(&workFlags[flagSlot[i]]);
 	}
 
 	workers.reserve(num_workers);
@@ -1558,8 +1614,11 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName, Pin pin) { WaitOnE
 bool TaskScheduler::Push(Task* task) {
 	JLIB_STAT(Pushes);
 	// A pool thread other than main keeps its own pushes on its own deque. Main distributes.
+	// Latency work is the exception: with K it goes to the lane intake (PushTarget), or it would
+	// wait behind whatever this worker is running.
 	Thread* self = Thread::GetCurrent();
-	if (task && self && self->IsPoolWorker() && !self->isMain) {
+	if (task && self && self->IsPoolWorker() && !self->isMain
+	    && !(IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled())) {
 		if (!deques[(size_t)self->qIndex]->push_bottom(task)) TaskDeque::FatalPushRefused();
 		return true;
 	}
@@ -1809,9 +1868,10 @@ bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 	TaskScheduler* s = instance;
 	
 	if (!s || !s->poolActive) return false;
-	if (GetHotWorkers() == 0) return false;      
+	if (GetHotWorkers() == 0) return false;      // the lane is K's: no K, no lane
 
-	if (!s->laneIntake.enqueue_bulk(tasks, n)) return false;   
+	if (!s->laneIntake.enqueue_bulk(tasks, n)) return false;
+	s->laneIntakeCount_.fetch_add((long long)n, std::memory_order_seq_cst);
 
 	s->ioLastPushNs_.store(MonotonicNs(), std::memory_order_relaxed);
 
@@ -1859,14 +1919,18 @@ bool TaskScheduler::IoLaneQuiet() noexcept {
 Task* TaskScheduler::TakeLaneIntake() noexcept {
 	TaskScheduler* s = instance;
 	if (!s || !s->poolActive) return nullptr;
+	if (s->laneIntakeCount_.load(std::memory_order_seq_cst) <= 0) return nullptr;
 	Task* t = nullptr;
-	return s->laneIntake.try_dequeue(t) ? t : nullptr;
+	if (!s->laneIntake.try_dequeue(t)) return nullptr;
+	s->laneIntakeCount_.fetch_sub(1, std::memory_order_relaxed);
+	return t;
 }
 
 bool TaskScheduler::LaneIntakeIdle() noexcept {
 	TaskScheduler* s = instance;
 	if (!s || !s->poolActive) return true;
-	return s->laneIntake.size_approx() == 0;
+	return s->laneIntakeCount_.load(std::memory_order_seq_cst) <= 0
+	    && s->laneIntake.size_approx() == 0;
 }
 
 bool TaskScheduler::PushIO(Task* task) noexcept {
@@ -2339,11 +2403,9 @@ bool TaskScheduler::PushTarget(Task* task, size_t worker) {
 		workers[idx]->NotifyWorker();
 	}
 	else {
-		const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
-
 		// Latency work goes to the shared lane intake, never one worker's inbox (the hi-pri inbox is
 		// PushTo's). Refused by the intake -- off, or no K -- it is placed like normal work.
-		if (IsLowLatency(useHi) && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+		if (IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
 			return true;
 
 		const uint8_t chosen = (uint8_t)PickNextWorker(Lane::Normal);
@@ -2599,10 +2661,8 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		if (PushTarget(task)) return RequeueResult::Stealable;
 	}
 
-	const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
-
 	// Same placement as PushTarget: latency work to the shared intake, never a worker's inbox.
-	if (IsLowLatency(useHi) && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+	if (IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
 		return RequeueResult::Stealable;
 
 	const uint8_t chosen = (uint8_t)PickNextWorker(Lane::Normal);

@@ -18,6 +18,8 @@ namespace JLib {
             "inbox staged to deque",
             "steal probes", "steal hits",
             "sticky steal probes (same victim again)", "sticky steal hits",
+            "steal probes into another L3 group",
+            "seek probes (flag scan after a cursor miss)", "seek hits",
             "work flag writes (deque empty <-> non-empty)",
             "blocks (BlockBegin)", "blocks with no free adopter",
             "hunts entered",

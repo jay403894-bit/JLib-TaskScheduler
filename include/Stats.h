@@ -23,7 +23,7 @@ namespace JLib {
         RunLambda, RunFiber, RunCoroutine,
         InboxStaged,
         StealProbes, StealHits,
-        StickyProbes, StickyHits,
+        StickyProbes, StickyHits, StealRemoteProbes, SeekProbes, SeekHits,
         WorkFlagWrites,
         Blocks, BlocksNoAdopter,
         HuntEntered,

@@ -156,6 +156,12 @@ void Thread::AdoptCurrentThread(size_t fiberCacheCapacity)
 			             : TaskScheduler::PowerThrottling::OptOut;
 		}
 		ApplyPowerThrottling(pt);
+		// K runs above the compute workers. It never parks, and a spinning thread at normal priority
+		// takes turns with every busy thread once the machine is saturated: measured p99 latency of
+		// 0.2-3 ms and p99.9 up to 28 ms at normal, 4-104 us at high (medians unchanged). Best effort
+		// on Linux, where a negative nice needs privileges.
+		if (qIndex >= 0 && TaskScheduler::IsReservedIndex((size_t)qIndex, scheduler->workers.size()))
+			ApplyWorkerPriority(WorkerPrio::High);
 	}
 
 	localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Standard);
@@ -696,6 +702,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 
 	int stealVictim = qIndex;
 	int stickyLeft  = 0;   // passes left on the victim of the last steal (sticky steal cap)
+	unsigned fairPass = 0;   // passes since start: every kFairTickEvery-th drains the inbox regardless
+	size_t   l3Local = 0, l3Remote = 0;   // cursors into this worker's L3 group / the other groups
+	unsigned scanRot = 0;   // seek: this thread's rotation over the flag mask
 	// A reserved worker (K) holding a task it stole. Checked once at dispatch, then cleared.
 	bool stolenOnK = false;
 
@@ -756,22 +765,11 @@ bool Thread::Worker(WaitCtx* ctx) {
 			leaveHunt();
 			idleSpins = 0;   // work exists: the next empty pass starts scanning at full speed
 
-			// Inbox work cannot be stolen, so before a possibly long run it is moved where thieves
-			// can reach it -- but only when the deque has nothing for them already. A non-empty deque
-			// is drained first; the inbox is taken again when it runs dry (drainOwnInbox below).
-			constexpr size_t kPublishAtMost = 32;
-			if (!isReservedWorker
-			    && scheduler->deques[qIndex]->size_approx() == 0) {
-				size_t got = 0;
-				while (got < kPublishAtMost && scheduler->normalInboxes[qIndex]->pop(batch[got]))
-					if (batch[got]) ++got;
-
-				if (got) {
-					if (!scheduler->deques[qIndex]->push_bottom_batch(batch, got))
-						TaskDeque::FatalPushRefused();
-					JLIB_STAT_N(InboxStaged, got);
-				}
-			}
+			// No publish of the inbox here. Moving it onto the deque just before running this task
+			// put it UNDER whatever the task pushes next, and a task that keeps pushing its successor
+			// then buried it for good (tests/inbox_fairness_test.cpp: 0 of 62 ran; 62 of 62 without).
+			// The inbox goes onto the deque when the deque runs dry and on the fairness tick -- at
+			// the bottom, so the next pops take it.
 
 			// K runs a stolen task as a compute worker until it returns (or yields). The steal gate
 			// allowed the pickup; this checks whether I/O reached K after it. Only K's own I/O
@@ -914,6 +912,16 @@ bool Thread::Worker(WaitCtx* ctx) {
 				}
 			}
 
+			// Fairness tick, every kFairTickEvery-th pass of a compute worker. Normally the inbox is
+			// taken only when the worker's own deque is empty; a worker whose deque never empties
+			// (work that keeps pushing its successor) would then ignore its inbox forever. On the
+			// tick it drains the inbox regardless: the batch goes onto the bottom of its deque, the
+			// last one runs now, and the pops that follow take the rest.
+			const bool fairTick = !isReservedWorker && (++fairPass % TaskScheduler::kFairTickEvery == 0);
+#if !defined(JLIB_INBOX_CTL_NO_TICK)
+			if (!task_to_run && fairTick) drainOwnInbox();
+#endif
+
 			if (!task_to_run) {
 				Task* hp = nullptr;
 				if (scheduler->hiPriInboxes[qIndex]->pop(hp) && hp) {
@@ -923,7 +931,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 				}
 			}
 
-			if (yieldedLastPass) {
+			// Guarded: a task already taken this pass (the lane, the fairness tick) must not be
+			// overwritten -- it would be lost, never run and never requeued.
+			if (yieldedLastPass && !task_to_run) {
 				yieldedLastPass = false;
 
 				if (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent()) {
@@ -1005,18 +1015,34 @@ bool Thread::Worker(WaitCtx* ctx) {
 				const int nq = (int)scheduler->deques.size();
 				if (nq > 1) {
 
-					// One victim per pass. The cursor advances every pass, except that after a steal a
-					// compute worker stays on that victim for up to cap-1 more passes (sticky steal);
-					// the first miss there ends it and the cursor moves on next pass.
+					// Steal order, one pass:
+					//   1. cursor: one victim, rotating (within this worker's own L3 group when there
+					//      are several). The ONLY step that sticks: after a hit it stays on that
+					//      victim for up to cap-1 more passes; the first miss ends it.
+					//   2. seek: a deque in the own group whose flag is set, picked by a rotation
+					//      that moves every pass. Not sticky -- the next miss seeks it again.
+					//   3. the SMT sibling, if fat.
+					//   4. another L3, last of all and only when the own group shows no work: a
+					//      remote steal misses on the deque and on the task's data. Not sticky.
+					const bool grouped = scheduler->l3Groups > 1;
+					const size_t myG = grouped ? scheduler->l3GroupOf[(size_t)qIndex] : 0;
 					const bool sticking = stickyLeft > 0;
-					if (!sticking) {
+					if (sticking) {
+						JLIB_STAT(StickyProbes);
+					} else if (grouped) {
+						const std::vector<int>& mine = scheduler->l3Members[myG];
+						const size_t m = mine.size();
+						for (size_t i = 1; i <= m; ++i) {
+							l3Local = (l3Local + 1) % m;
+							if (mine[l3Local] != qIndex) break;
+						}
+						stealVictim = mine[l3Local];
+					} else {
 						stealVictim = (stealVictim + 1) % nq;
 						if (stealVictim == qIndex) stealVictim = (stealVictim + 1) % nq;
-					} else {
-						JLIB_STAT(StickyProbes);
 					}
 
-					const bool hit = tryStealFrom(stealVictim);
+					bool hit = stealVictim != qIndex && tryStealFrom(stealVictim);
 					if (hit && !isReservedWorker) {
 						if (sticking) { JLIB_STAT(StickyHits); --stickyLeft; }
 						else          stickyLeft = (int)scheduler->GetStickyStealCap() - 1;
@@ -1024,13 +1050,45 @@ bool Thread::Worker(WaitCtx* ctx) {
 						stickyLeft = 0;
 					}
 
-					// A compute worker that missed gets one extra probe: its SMT sibling, only if fat.
+					// 2. Seek (own group).
+					if (!hit && !isReservedWorker && nq <= 64 && scheduler->SeekOnMiss()) {
+						uint64_t mask = 0;
+						for (int v = 0; v < nq; ++v)
+							if (v != qIndex && v != stealVictim
+							    && (!grouped || scheduler->l3GroupOf[(size_t)v] == myG)
+							    && scheduler->DequeHasWork((size_t)v))
+								mask |= uint64_t(1) << v;
+						if (mask) {
+							scanRot = (scanRot + 1 + (unsigned)qIndex) & 63u;
+							const unsigned r = scanRot;
+							const uint64_t rot = r ? ((mask >> r) | (mask << (64 - r))) : mask;
+							unsigned b = 0;
+							while (!((rot >> b) & 1u)) ++b;
+							JLIB_STAT(SeekProbes);
+							if (tryStealFrom((int)((b + r) & 63u))) { JLIB_STAT(SeekHits); hit = true; }
+						}
+					}
+
+					// 3. The SMT sibling, only if fat.
 					if (!hit && !isReservedWorker) {
 						const int sib = ((size_t)qIndex < scheduler->siblingQIndex.size())
 						              ? scheduler->siblingQIndex[qIndex] : -1;
 						if (sib >= 0 && sib != stealVictim && sib != qIndex && sib < nq
 						    && scheduler->deques[sib]->size_approx() > TaskScheduler::kFatDeque)
-							tryStealFrom(sib);
+							hit = tryStealFrom(sib);
+					}
+
+					// 4. Another L3: last, and only when nothing in the own group is flagged.
+					if (!hit && grouped) {
+						bool localWork = false;
+						for (int v : scheduler->l3Members[myG])
+							if (v != qIndex && scheduler->DequeHasWork((size_t)v)) { localWork = true; break; }
+						if (!localWork) {
+							const std::vector<int>& others = scheduler->l3Others[myG];
+							l3Remote = (l3Remote + 1) % others.size();
+							JLIB_STAT(StealRemoteProbes);
+							hit = tryStealFrom(others[l3Remote]);
+						}
 					}
 				}
 
@@ -1114,7 +1172,10 @@ bool Thread::Worker(WaitCtx* ctx) {
 					//
 					// kHotPasses is a duration, not a count: a pass is ~100 ns, so ~2000 of them is
 					// ~200 us of full-speed hunting after the last task ran.
-					if (!tryLeaveHuntForPark()) {
+					// K never parks: it stays up the same way. A parked K costs latency work a full
+					// OS wake -- measured 10-85 us p50 (up to ~300 us p99) against 0.6-5 us awake --
+					// and, being off the idle stack, it would never be woken to steal compute.
+					if (!tryLeaveHuntForPark() || isReservedWorker) {
 						constexpr unsigned kHotPasses = 2000;
 						if (idleSpins < kHotPasses) {
 							++idleSpins;

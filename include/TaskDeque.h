@@ -82,20 +82,20 @@ namespace JLib {
         // Racy on purpose: a stale true costs one failed steal attempt, and a stale false is
         // corrected the next time the owner pushes. Neither can strand work, because the owner
         // clears the flag only when its own deque is empty.
-        void SetWorkFlag(std::atomic<std::uint8_t>* flag) noexcept { workFlag_ = flag; }
+        //
+        // The owner keeps its own copy (flagMirror_), so a push compares locally and touches the
+        // shared line only when the value changes.
+        void SetWorkFlag(std::atomic<std::uint8_t>* flag) noexcept { workFlag_ = flag; flagMirror_ = 0; }
 
-        void MarkHasWork() noexcept {
-            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) == 0) {
-                workFlag_->store(1, std::memory_order_relaxed);
+        void StoreFlag(std::uint8_t v) noexcept {
+            if (workFlag_ && flagMirror_ != v) {
+                flagMirror_ = v;
+                workFlag_->store(v, std::memory_order_relaxed);
                 JLIB_STAT(WorkFlagWrites);
             }
         }
-        void MarkEmpty() noexcept {
-            if (workFlag_ && workFlag_->load(std::memory_order_relaxed) != 0) {
-                workFlag_->store(0, std::memory_order_relaxed);
-                JLIB_STAT(WorkFlagWrites);
-            }
-        }
+        void MarkHasWork() noexcept { StoreFlag(1); }
+        void MarkEmpty() noexcept { StoreFlag(0); }
 
         static Ring* MakeRing(size_t capacity) {
             Ring* r = new Ring{ capacity - 1, capacity, new std::atomic<uintptr_t>[capacity] };
@@ -357,6 +357,7 @@ namespace JLib {
         size_t      ownerIndex_ = SIZE_MAX;
         const char* ownerLane_  = "untagged";
         bool        pushOnly_   = false;   // SetPushOnly; set before publication, never cleared
+        std::uint8_t flagMirror_ = 0;      // the owner's copy of *workFlag_ (it is the only writer)
         std::atomic<std::uint8_t>* workFlag_ = nullptr;   // lives in the scheduler's flag array
 
         alignas(platform::kCacheLine) std::atomic<size_t> top_;
