@@ -57,8 +57,9 @@ static void *worker(void *arg) {
 
     for (int pass = 0; pass < PASSES; ++pass) {
 
-#if !defined(CLEAR_AFTER_SEARCH) && !defined(CLEAR_ON_IDLE)
-
+        // -DCLEAR_TOP_OF_PASS: the PRE-2026-09-18 shape, kept only as a control -- it cost a
+        // seq_cst store per task, and Thread.cpp:1003-1006 records why it went.
+#if defined(CLEAR_TOP_OF_PASS)
         atomic_exchange_explicit(&g_flag, 0, TRANSITION);
 #endif
 
@@ -79,11 +80,20 @@ static void *worker(void *arg) {
             return NULL;
         }
 
-#ifdef CLEAR_ON_IDLE
-        // Shipping since 2026-09-18 (Thread.cpp idle gate): not cleared at the top of each pass. On
-        // the way to idle, a set flag is cleared and the search runs again.
+        // THE SHIPPING SHAPE, and now the DEFAULT (Thread.cpp:1003-1010): the flag is not cleared
+        // at the top of a pass, only on the way to idle and only when it is already set.
+        //
+        // LOAD THEN STORE, not an exchange: the code is two separate seq_cst operations, so a
+        // MarkQueuedWork landing between them is erased. That is safe only because the pusher's
+        // Wake() also leaves NOTIFIED, which the park CAS below consumes -- an exchange here would
+        // hide that interleaving from the model. -DCLEAR_EXCHANGE restores the exchange.
+#if !defined(CLEAR_TOP_OF_PASS) && !defined(CLEAR_AFTER_SEARCH)
         if (atomic_load_explicit(&g_flag, OBSERVE) != 0) {
+  #ifdef CLEAR_EXCHANGE
             atomic_exchange_explicit(&g_flag, 0, TRANSITION);
+  #else
+            atomic_store_explicit(&g_flag, 0, TRANSITION);
+  #endif
             continue;
         }
 #endif

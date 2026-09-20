@@ -232,7 +232,13 @@ namespace JLib {
                         detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
                     }
                     detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed);
-                    s.PushBatch(arr, n, TaskScheduler::kAnyWorker, 64);
+                    // Each completion to a compute worker's hi-pri inbox, round-robin with a wake.
+                    // That inbox is checked every pass ahead of the worker's own deque, so a busy
+                    // worker takes it at its next task boundary. A normal inbox is drained only
+                    // when the deque runs dry or on the fairness tick: under load a completion
+                    // placed there waited behind the worker's own successors (measured ~3 ms vs
+                    // ~100 us here, 200 us tasks).
+                    for (std::size_t i = 0; i < n; ++i) s.PushTo(arr[i], CorePref::Any, true);
                 };
                 pushSteered(hi, nh, Lane::LowLatency);  nh = 0;
                 pushSteered(lo, nl, Lane::Normal); nl = 0;

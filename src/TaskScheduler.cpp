@@ -7,7 +7,7 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   
-#include "../include/FiberRegistry.h"   
+#include "../include/TaskLocal.h"   
 
 #include "../include/IoReactor.h" 
 #include "../include/Reclaimer.h"  
@@ -274,10 +274,8 @@ void TaskScheduler::Init(const Config& requested) {
 		cfg.main = (cfg.mode == Mode::Migrate) ? MainMode::InPool : MainMode::OutOfPool;
 	if (cfg.ioCompletionThreads == 0) cfg.ioCompletionThreads = 1;
 	if (cfg.hotWorkers > kMaxReservedWorkers) cfg.hotWorkers = kMaxReservedWorkers;
-	if (cfg.io) {
-		cfg.timers = true;
-		if (cfg.hotWorkers == 0) cfg.hotWorkers = 1;   // the reactor hands completions to K
-	}
+	// I/O needs no K: the reactor hands completions to the pool as jobs (hi-pri inboxes).
+	if (cfg.io) cfg.timers = true;
 	detail::SlabGrowthEnabled().store(cfg.slabGrowth, std::memory_order_relaxed);
 
 	instance = new TaskScheduler(cfg);
@@ -352,32 +350,42 @@ void TaskScheduler::PushMainQueue(Task* task) {
 	KickWaitWord(&g_outOfPoolMainWait);
 }
 
-bool TaskScheduler::RunOneMainTask() {
-	Task* t = nullptr;
-	if (!mainQ.pop(t) || !t) return false;
-	if (DiscardIfCancelled(t)) return true;
+// A task in mainQ is either fresh (run its body on main's own stack) or a resume: a task pinned
+// with Pin::Main that already has a fiber, which must be switched into, not run from the top.
+// Main's helper does the switch, and its OnFiberReturned settles a second suspension or the death.
+void TaskScheduler::RunMainTask(Task* t) {
+	if (t->started && t->record && t->record->fiber) {
+		Thread* self = Thread::GetCurrent();
+		if (self) { self->RunHelped(t); return; }
+	}
 	t->Execute();
 	if (t->waitGroup) {
 		t->waitGroup->Done();
 	}
 	FreeTask(t);
+}
+
+bool TaskScheduler::RunOneMainTask() {
+	Task* t = nullptr;
+	if (!mainQ.pop(t) || !t) return false;
+	if (DiscardIfCancelled(t)) return true;
+	RunMainTask(t);
 	return true;
 }
 
-// Main out of the pool, waiting on a group: take routed work, a few steals, then park on the
-// group. Never a continuous scan -- that would slow the workers doing the group's work.
+// Main out of the pool, waiting on a group: take work routed TO MAIN, then park on the group.
+//
+// It does not steal. Main out of the pool has no slot, so a stealing main is a stand-in thread by
+// another name -- the same shape as the spares this pool deliberately does not have, with the same
+// identity problem: nothing can pin to it, Pin::Current degrades to no pin there, and main's own
+// deadline then depends on whatever task it happened to pick up. Main steals only when it is IN
+// the pool, where it is worker 0 with a slot and everything can name it.
 void TaskScheduler::OutOfPoolMainWait(WaitGroup& wg) {
 	static constexpr unsigned kAttemptsBeforePark = 32;
 	auto count = [&] { return wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK; };
 	unsigned attempts = 0;
 	while (count() > 0) {
-		if (const size_t h = FiberRegistry::Instance().CurrentHolder(); h != FiberRegistry::kNoHolder)
-			if (FiberRegistry::Instance().HolderHasWork(h))
-				FiberRegistry::Instance().DrainHolder(h);
-
-		if (RunOneMainTask()) { attempts = 0; continue; }   // routed to main
-		const bool stole = mainHelper ? mainHelper->HelpSteal() : TryRunStolenNativeTask();
-		if (stole)            { attempts = 0; continue; }   // one bounded steal
+		if (RunOneMainTask()) { attempts = 0; continue; }   // routed to main (Pin::Main included)
 		if (++attempts < kAttemptsBeforePark) { platform::CpuRelax(); continue; }
 		attempts = 0;
 
@@ -436,20 +444,11 @@ bool TaskScheduler::DiscardIfCancelled(Task* task) {
 void TaskScheduler::ProcessMainThread() {
 	if (!poolActive) return;
 
-	if (const size_t h = FiberRegistry::Instance().CurrentHolder(); h != FiberRegistry::kNoHolder)
-		if (FiberRegistry::Instance().HolderHasWork(h))
-			FiberRegistry::Instance().DrainHolder(h);
-
 	Task* t;
 	while (mainQ.pop(t)) {
 		if (!t) continue;
 		if (DiscardIfCancelled(t)) continue;
-		t->Execute();
-		if (t->waitGroup) {
-			t->waitGroup->Done();
-		}
-		
-		FreeTask(t);
+		RunMainTask(t);
 	}
 }
 
@@ -529,9 +528,6 @@ void TaskScheduler::Join() {
 				if (workers[i]->busy.load(std::memory_order_acquire)) idle = false;
 				else if (!hiPriInboxes[i]->empty() || !normalInboxes[i]->empty()) idle = false;
 			}
-			for (Thread* sp : spares)
-				if (sp->busy.load(std::memory_order_acquire)) idle = false;
-			
 			for (size_t i = 0; i < deques.size() && idle; ++i)
 				
 				if (deques[i]->size_approx() != 0
@@ -564,11 +560,6 @@ void TaskScheduler::Join() {
 		if (worker && worker->GetThread().joinable())
 			worker->GetThread().join();
 
-	for (Thread* sp : spares) sp->RequestStop();
-	for (Thread* sp : spares)
-		if (sp->GetThread().joinable()) sp->GetThread().join();
-
-	FiberRegistry::Instance().DrainAllForTeardown();
 
 	if (!Reclaimer::Drain()) {
 		std::fprintf(stderr,
@@ -584,7 +575,6 @@ void TaskScheduler::Join() {
 		std::uint64_t acq = 0, rec = 0;
 		for (Thread* w : workers) { if (w) { acq += w->FiberAcquireCount(); rec += w->FiberRecycleCount(); } }
 		if (mainHelper) { acq += mainHelper->FiberAcquireCount(); rec += mainHelper->FiberRecycleCount(); }
-		for (Thread* sp : spares) { acq += sp->FiberAcquireCount(); rec += sp->FiberRecycleCount(); }
 		const std::uint64_t outstanding = acq > rec ? acq - rec : 0;
 		if (outstanding > 0) {
 			std::printf("[JLib::Scheduler] FIBER ROW LEAK at teardown: %llu rows acquired, %llu "
@@ -611,8 +601,6 @@ void TaskScheduler::Join() {
 		}
 		for (Thread* w : workers) delete w;
 		workers.clear();
-		for (Thread* sp : spares) delete sp;
-		spares.clear();
 		mainQ.clear();
 		poolMutex.unlock();
 	}
@@ -1123,7 +1111,7 @@ haveWidth:
 // One piece of a lazily split range. Runs grain by grain; whenever this thread's own deque is empty
 // (nobody is waiting on it for work) it gives the upper half away there, counted in `wg` before the
 // push. The piece holds a count of its own while it runs, so the group cannot reach zero early.
-// A thread with no deque (main out of the pool, a spare) just runs the range.
+// A thread with no deque (main out of the pool) just runs the range.
 void TaskScheduler::RunLazyPiece(std::function<void(int, int)>* func, int lo, int hi, int grain,
                                  WaitGroup* wg) {
 	TaskDeque* dq = LaneForCurrentThread();   // own deque, or the non-worker deque main holds
@@ -1171,7 +1159,7 @@ void TaskScheduler::RunLazyRange(int start, int end, int grain, std::function<vo
 		for (size_t q = 0; q < computeN && nIdle + nBusy < maxOthers; ++q) {
 			Thread* w = workers[q];
 			if (!w || (int)q == myQ || w->isMain || !isPCore[q]) continue;
-			if (w->adoptSlot.load(std::memory_order_relaxed) == Thread::kAdoptAway) continue;
+			if (w->away.load(std::memory_order_relaxed)) continue;   // blocked: its slot is busy
 			if (w->busy.load(std::memory_order_relaxed)) busyQ[nBusy++] = (int)q;
 			else                                         idleQ[nIdle++] = (int)q;
 		}
@@ -1409,10 +1397,8 @@ void TaskScheduler::StartPool(size_t poolSize) {
 
 	unsigned int num_workers = static_cast<unsigned int>(poolSize);
 	
-	// Pool slots: main + workers, then the spares (a spare is not a queue slot but runs tasks, so
-	// it needs an epoch slot of its own), then the ThreadScope slots.
-	const size_t spareN = (cfg_.mode == Mode::Pinned) ? 0 : cfg_.spareThreads;
-	EpochManager::Instance().Init(num_workers + 1 + spareN, cfg_.externalThreads);
+	// Pool slots: main + workers, then the ThreadScope slots.
+	EpochManager::Instance().Init(num_workers + 1, cfg_.externalThreads);
 	
 	{
 		const std::vector<int>& cpuList = !physicalCpus.empty() ? physicalCpus : logicalCpus;
@@ -1449,7 +1435,6 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	                                     compute * DeepFibersPerComputeWorker(),
 	                                     FiberMemoryLimit());
 	
-	FiberRegistry::Instance().Build(globalPool, num_workers);
 
 	for (Thread* w : workers) delete w;
 	workers.clear();
@@ -1550,20 +1535,10 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		mainHelper->isHelper = true;
 		mainHelper->AdoptAsHelper();
 	}
-	for (size_t i = 0; i < spareN; ++i) {
-		Thread* sp = new Thread(*this);
-		sp->qIndex  = -1;
-		sp->isSpare = true;
-		sp->epochId = (size_t)num_workers + 1 + i;
-		spares.push_back(sp);
-		sp->StartSpare(fiberCacheCapacity);
-	}
 	for (auto& w : workers) {
 		while (!w->Ready())
 			std::this_thread::yield();
 	}
-	for (Thread* sp : spares)
-		while (!sp->Ready()) std::this_thread::yield();
 
 	assert((mainInPool
 	          ? (deques.size() == workers.size())
@@ -1834,10 +1809,12 @@ bool TaskScheduler::PushTo(Task* task, CorePref pref, bool hiPri) {
 			if (!candidate(q, pref)) continue;
 			if (pass == 0 && k) { --k; continue; }
 			if (first == computeN) first = q;
-			if (workers[q]->adoptSlot.load(std::memory_order_relaxed) != Thread::kAdoptAway) { pick = q; break; }
+			if (!workers[q]->away.load(std::memory_order_relaxed)) { pick = q; break; }
 		}
 	}
-	if (pick == computeN) pick = first;   // every candidate away: the adopter takes it
+	// Every candidate away: the work waits for whichever thread it lands on to come back. Nobody
+	// may consume another thread's inbox, so there is no better target left.
+	if (pick == computeN) pick = first;
 	if (pick == computeN) return false;
 	if (hiPri) return PushTo(pick, task);
 
@@ -2224,11 +2201,17 @@ void JLib::StampPin(Task* t, Pin pin) noexcept {
 	if (!t || !t->record) return;
 	JLIB_STAT(Suspends);
 	JLIB_STAT_ONLY(t->record->statSuspendAt = JLIB_STAT_TICKS();)
-	uint16_t target = TaskScheduler::PinForced() ? Pin::kCurrent : pin.target;
+	// Pin::Main survives Mode::Pinned: it names a thread the caller chose for a reason (a device
+	// context, a window, a driver), which is the same reason Pinned exists.
+	uint16_t target = (TaskScheduler::PinForced() && pin.target != Pin::kMain)
+	                ? Pin::kCurrent : pin.target;
 	if (target == Pin::kCurrent) {
 		Thread* self = Thread::GetCurrent();
 		// Off the pool (main's helper, user threads) nothing can be pinned: no pin.
 		target = (self && self->IsPoolWorker()) ? (uint16_t)self->qIndex : TaskRecord::kNoPin;
+	} else if (target == Pin::kMain) {
+		// Kept as the sentinel: the resume paths send it to main's queue, which is slot 0's
+		// hi-pri inbox in pool and mainWorkQ out of it.
 	} else if (target != Pin::kNone) {
 		const bool valid = TaskScheduler::IsInitialized()
 		                && target < TaskScheduler::Instance().GetWorkerCount();
@@ -2296,8 +2279,7 @@ void TaskScheduler::ReleaseRecord(TaskRecord* r) noexcept {
 
 bool TaskScheduler::HasFiberLocal() noexcept { return CurrentRecord() != nullptr; }
 
-uint16_t TaskScheduler::AllocFiberLocalSlot() noexcept { return FiberRegistry::FlsAlloc(); }
-FiberRegistry& TaskScheduler::Fibers() noexcept        { return FiberRegistry::Instance(); }
+uint16_t TaskScheduler::AllocFiberLocalSlot() noexcept { return AllocTaskLocalSlot(); }
 
 bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
                                         void (*release)(void*) noexcept) noexcept {
@@ -2312,28 +2294,6 @@ bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
 	node.next = r->debts;
 	r->debts  = &node;
 	return true;
-}
-
-bool TaskScheduler::ReleaseOnWorker(FiberDebt& node, void* obj,
-                                    void (*release)(void*) noexcept,
-                                    size_t holder, uint32_t kind) noexcept {
-	if (!obj || !release || kind == Fiber::kOwesNothing) return false;
-	TaskRecord* r = CurrentRecord();
-	if (!r) return false;
-
-	node.obj     = obj;
-	node.release = release;
-	node.holder  = holder;   // the cleanup chain visits this holder at death
-
-	node.next = r->debts;
-	r->debts  = &node;
-
-	r->owedKinds = (uint8_t)(r->owedKinds | kind);
-	return true;
-}
-
-size_t TaskScheduler::DischargeFiberDebts(TaskRecord* r, size_t holder) noexcept {
-	return FiberRegistry::DischargeDebts(r, holder);
 }
 
 void*& TaskScheduler::FiberLocal(size_t slot) noexcept {
@@ -2435,13 +2395,6 @@ bool TaskScheduler::PushTarget(Task* task, size_t worker) {
 	return true;
 }
 
-void TaskScheduler::WakeAdopterOf(int q) noexcept {
-	for (Thread* sp : spares)
-		if (sp->adoptSlot.load(std::memory_order_seq_cst) == q) { sp->Wake(); return; }
-	for (Thread* w : workers)
-		if (w && w->adoptSlot.load(std::memory_order_seq_cst) == q) { w->Wake(); return; }
-}
-
 void TaskScheduler::BlockBegin() {
 	TaskScheduler* s = instance;
 	Thread* self = Thread::GetCurrent();
@@ -2464,51 +2417,21 @@ void TaskScheduler::BlockBegin() {
 		    && !warned.exchange(true, std::memory_order_relaxed)) {
 			std::fprintf(stderr,
 				"[JLib::Scheduler] NOTE: a thread is blocking with pinned work queued for it%s. Pinned\n"
-				"  and main-only work waits for that thread to return; only unpinned work is adopted.\n"
+				"  and main-only work waits for that thread to return: only this thread may run it.\n"
 				"  This note prints once.\n", PinForced() ? " (Mode::Pinned pins every suspension)" : "");
 			std::fflush(stderr);
 		}
 	}
-	if (IsReservedIndex(me, n)) return;   // K never drains a normal inbox: there is nothing to adopt
+	(void)n;
+	if (IsReservedIndex(me, n)) return;   // K has no normal inbox to unload
 
-	// What is already queued goes onto the deque, where it can be stolen right away.
+	// The slot is busy until the call returns, and nothing stands in for it. Two things stop the
+	// stall from hiding work as well: what is already queued goes onto the deque, where anyone may
+	// steal it, and `away` takes this thread out of the running for unplaced pushes meanwhile.
 	self->DrainOwnInboxesToDeques();
-
-	// A worker that is itself adopting keeps that adoption (its owner's handback still finds it)
-	// and takes the fallback: drain the adopted inbox once too, and later pushes wait.
-	if (self->adoptSlot.load(std::memory_order_seq_cst) >= 0) {
-		while (self->DrainAdoptedInbox()) {}
-		JLIB_STAT(BlocksNoAdopter);
-		return;
-	}
-
-	// Claim an adopter with a CAS, never a plain exchange (that would steal another blocker's).
-	// A parked spare first -- it keeps the pool at full width -- then a free compute worker. Main
-	// (in the pool) and K are never adopters: neither runs the loop that drains an adopted inbox.
-	auto claim = [&](Thread* t) {
-		int expected = Thread::kAdoptNone;
-		if (!t->adoptSlot.compare_exchange_strong(expected, (int)me,
-				std::memory_order_seq_cst, std::memory_order_seq_cst)) return false;
-		self->adopter = t;
-		return true;
-	};
-	for (Thread* sp : s->spares)
-		if (claim(sp)) break;
-	if (!self->adopter) {
-		const size_t computeN = n - GetHotWorkers();
-		const bool mainInPool = GetMainMode() == MainMode::InPool;
-		for (size_t i = 1; i < computeN; ++i) {
-			const size_t w = (me + i) % computeN;
-			if (mainInPool && w == 0) continue;
-			if (claim(s->workers[w])) break;
-		}
-	}
-	// Away, adopted or not: a wake for this thread now goes to its adopter.
-	self->adoptSlot.store(Thread::kAdoptAway, std::memory_order_seq_cst);
-	std::atomic_thread_fence(std::memory_order_seq_cst);
-	if (self->adopter) self->adopter->Wake();
-	else JLIB_STAT(BlocksNoAdopter);   // everyone else is blocked or adopting: pushes wait
+	self->away.store(true, std::memory_order_seq_cst);
 }
+
 
 void TaskScheduler::BlockEnd() {
 	TaskScheduler* s = instance;
@@ -2517,22 +2440,9 @@ void TaskScheduler::BlockEnd() {
 	assert(self->blockDepth > 0 && "BlockEnd without BlockBegin");
 	if (self->blockDepth == 0 || --self->blockDepth != 0) return;
 	if (IsReservedIndex((size_t)self->qIndex, s->workers.size())) return;
-	if (self->adoptSlot.load(std::memory_order_relaxed) != Thread::kAdoptAway) return;   // was adopting: kept it
 
-	const int me = self->qIndex;
-	Thread* adopter = self->adopter;
-	if (adopter) {
-		int expected = me;
-		adopter->adoptSlot.compare_exchange_strong(expected, Thread::kAdoptNone,
-			std::memory_order_seq_cst, std::memory_order_seq_cst);
-	}
-	self->adoptSlot.store(Thread::kAdoptNone, std::memory_order_seq_cst);
-	if (adopter) {
-		// The adopter may be mid-pop from this inbox: wait that out (a pop, never a task).
-		while (adopter->draining.load(std::memory_order_seq_cst) == me)
-			platform::CpuRelax();
-		self->adopter = nullptr;
-	}
+	// Back in the running for unplaced pushes. Its own queues were never touched by anyone else.
+	self->away.store(false, std::memory_order_seq_cst);
 }
 
 [[noreturn]] void JLib::FatalNoEpochSlot() {
@@ -2606,6 +2516,7 @@ void TaskScheduler::ResumeFiber(Task* task) {
 	if (!task) return;
 	if (task->type == TaskType::Main) { PushMainQueue(task); return; }
 	const uint16_t pin = task->record->pinTo;
+	if (pin == Pin::kMain) { JLIB_STAT(ResumePinned); PushMainQueue(task); return; }
 	if (pin != TaskRecord::kNoPin) { JLIB_STAT(ResumePinned); PushTo(pin, task); return; }   // hi-pri inbox, never stolen
 	if (IsNormalLane(task->lane)) {
 		if (Thread* self = ComputeSelf(*this, workers)) {
@@ -2625,6 +2536,7 @@ bool TaskScheduler::YieldFiber(Task* task) {
 	const size_t q = (size_t)self->qIndex;
 	if (task->type == TaskType::Main) { PushMainQueue(task); return self->isMain; }
 	const uint16_t pin = task->record->pinTo;
+	if (pin == Pin::kMain) { JLIB_STAT(ResumePinned); PushMainQueue(task); return self->isMain; }
 	if (pin == q) {   // pinned here: own hi-pri inbox, no wake needed
 		JLIB_STAT(ResumePinned);
 		hiPriInboxes[q]->push(task);
@@ -2653,6 +2565,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	if (task->type == TaskType::Main) { PushMainQueue(task); return RequeueResult::Pinned; }
 
 	const uint16_t pin = task->record->pinTo;
+	if (pin == Pin::kMain) { PushMainQueue(task); return RequeueResult::Pinned; }
 	if (pin != TaskRecord::kNoPin && PushTo(pin, task)) {
 		return RequeueResult::Pinned;
 	}
@@ -2696,13 +2609,13 @@ int TaskScheduler::PickNextWorker(Lane lane) {
 		if (idleQ != kNoIdleWorker && idleQ < computeN) return (int)idleQ;
 	}
 
-	// A thread that is away (blocked; its inbox adopted) is skipped as a hint: the adopter would
-	// take the push anyway, but a live target is one fewer hop. Adoption is what makes it safe.
+	// A thread that is away is blocked in code it cannot suspend, and nobody may drain its inbox:
+	// unplaced work sent there would wait for the call to return. Skip it while a live target exists.
 	for (size_t i = 0; i < computeN; ++i) {
 		const size_t q = (start + i) % computeN;
 		Thread* w = workers[q];
 		if (w && !w->idleLinked.load(std::memory_order_relaxed)
-		      && w->adoptSlot.load(std::memory_order_relaxed) != Thread::kAdoptAway)
+		      && !w->away.load(std::memory_order_relaxed))
 			return (int)q;
 	}
 
@@ -2788,6 +2701,15 @@ void SchedulerMutex::Lock(Pin pin) {
 		if (Try_Lock()) return;
 
 		if (thread != nullptr && thread->currentRunningTask != nullptr) {
+			// A task with no fiber may take this lock but may not WAIT on it (below). A hold it just
+			// missed by a few hundred cycles is not a design error, though, so spin it out first:
+			// this only ever spins while another thread runs the critical section, and a holder that
+			// suspended instead is exactly the case that must not be waited for -- it falls through.
+			constexpr int kNoFiberSpins = 256;
+			for (int i = 0; i < kNoFiberSpins; ++i) {
+				platform::CpuRelax();
+				if (Try_Lock()) return;
+			}
 			if (auto hook = s_blockViolationHook.load(std::memory_order_relaxed)) { hook(); return; }
 			fprintf(stderr,
 				"[JLib::Scheduler] INVARIANT VIOLATED: a task with no fiber blocked on a contended\n"

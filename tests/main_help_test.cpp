@@ -1,4 +1,13 @@
-// MainMode::OutOfPool: main's helper runs stolen tasks (fibers included) while it waits.
+// MainMode::OutOfPool: main does NOT steal while it waits -- it runs only what is routed TO it.
+//
+// Main out of the pool has no slot, so a stealing main is a stand-in thread by another name: the
+// same shape as a spare, with the same problems. Nothing can pin to it, and worse, it could steal
+// a task that BLOCKS THE THREAD (BlockInPlace, a driver call) and take main out for an unbounded
+// time -- a missed frame in the one thread that cannot miss one. Main steals only when it is IN
+// the pool, where it is worker 0 with a slot.
+//
+// So this test asserts the opposite of what it used to: the pool finishes the work, main runs the
+// main-only tasks, and main runs NOTHING it was not given.
 #include <TaskScheduler.h>
 #include <Thread.h>
 #include <atomic>
@@ -53,7 +62,7 @@ int main() {
 	std::printf("main_help_test workers=%zu helper=%d\n", s.GetWorkerCount(), me && me->isHelper ? 1 : 0);
 	Check(me && me->isHelper && !me->IsPoolWorker(), "main has a helper Thread that is not a pool slot");
 
-	std::printf("[fibers and lambdas, main helping]\n");
+	std::printf("[fibers and lambdas: the pool does them, main does not steal]\n");
 	constexpr int kN = 8000;
 	std::thread([&s] {
 		for (int k = 0; k < 10; ++k) {
@@ -78,7 +87,7 @@ int main() {
 	std::printf("  done=%d onMain=%d lambdasOnMain=%d suspendedOnMain=%d resumedOnMain=%d\n",
 		g_done.load(), g_onMain.load(), g_lambdaOnMain.load(), g_suspendedOnMain.load(), g_resumedOnMain.load());
 	Check(g_done == kN && lambdas == 2000, "every task completed");
-	Check(g_onMain + g_lambdaOnMain > 0, "main ran some of them while waiting");
+	Check(g_onMain + g_lambdaOnMain == 0, "main ran none of them: it does not steal out of the pool");
 
 	std::printf("[PushMain while main is parked in WaitFor]\n");
 	{

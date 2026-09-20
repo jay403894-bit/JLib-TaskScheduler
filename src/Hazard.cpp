@@ -49,8 +49,16 @@ namespace JLib {
             AdoptOrphans(items);
         }
 
-        std::uint64_t ThisThreadId() {
-            
+        // NOINLINE, and with a clobber, deliberately. glibc declares pthread_self (which is what
+        // std::this_thread::get_id() is) __attribute_const__: the compiler may assume the result
+        // depends on nothing in memory and CSE it ACROSS our context switch -- so a fiber that
+        // migrates would keep the identity of the thread it started on and reach into that
+        // thread's hazard cells. A "memory" clobber alone does not stop it (const means "reads no
+        // memory"); what stops it is that this call cannot be inlined or proved pure.
+        JLIB_NOINLINE std::uint64_t ThisThreadId() {
+#if defined(__GNUC__) && !defined(_MSC_VER)
+            __asm__ __volatile__("" ::: "memory");
+#endif
             return static_cast<std::uint64_t>(
                        std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1ull;
         }

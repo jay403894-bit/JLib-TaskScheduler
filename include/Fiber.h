@@ -170,8 +170,15 @@ namespace JLib {
 			}
 		}
 		
+		// The SwitchToFiber equivalent: hand this thread to another fiber directly. It is a SUSPEND
+		// POINT like Suspend/CoYield -- this fiber stops running here and may resume on a different
+		// thread -- so it takes the same two checks. The epoch one matters most: a guard held
+		// across it would be released by ~SlotEpochGuard into the slot of whatever thread finishes
+		// this fiber, clearing an innocent thread's pin.
 		inline bool SwitchTo(Fiber* f) {
 			if (!f || f == this) return false;
+			CheckSuspendable(this->owningTask, "Fiber::SwitchTo");
+			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::SwitchTo");
 
 			FiberStatus exp = FiberStatus::READY;
 			if (!f->status.compare_exchange_strong(exp, FiberStatus::RUNNING,

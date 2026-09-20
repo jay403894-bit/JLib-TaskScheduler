@@ -6,7 +6,7 @@
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Timer.h"   
-#include "../include/FiberRegistry.h"   
+#include "../include/TaskLocal.h"
 
 #include <cassert>
 #include <chrono>
@@ -372,37 +372,6 @@ void Thread::Wake() noexcept {
 #endif
 	}
 
-	// Blocked in code it cannot suspend: the push this wake announces is for whoever adopted this
-	// thread's inbox. The fence orders the push before the read -- without it a push made just
-	// before the adoption is invisible to the adopter the claim wakes (adopt_model.c,
-	// NO_REDIRECT_FENCE).
-	std::atomic_thread_fence(std::memory_order_seq_cst);
-	if (adoptSlot.load(std::memory_order_seq_cst) == kAdoptAway)
-		scheduler->WakeAdopterOf(qIndex);
-}
-
-bool Thread::DrainAdoptedInbox() {
-	const int q = adoptSlot.load(std::memory_order_seq_cst);
-	if (q < 0) return false;
-	// Announce, then recheck: an owner taking its inbox back clears the adoption first and then
-	// waits out `draining`, so the inbox never has two consumers.
-	draining.store(q, std::memory_order_seq_cst);
-	std::atomic_thread_fence(std::memory_order_seq_cst);
-	size_t n = 0;
-	if (adoptSlot.load(std::memory_order_seq_cst) == q) {
-		constexpr size_t BATCH = 64;
-		Task* batch[BATCH];
-		TaskMPSCQueue* inbox = scheduler->normalInboxes[(size_t)q].get();
-		while (n < BATCH && inbox->pop(batch[n])) if (batch[n]) ++n;
-		if (n && !scheduler->deques[qIndex]->push_bottom_batch(batch, n)) TaskDeque::FatalPushRefused();
-	}
-	draining.store(kAdoptNone, std::memory_order_seq_cst);
-	return n != 0;
-}
-
-bool Thread::AdoptedInboxHasWork() const {
-	const int q = adoptSlot.load(std::memory_order_seq_cst);
-	return q >= 0 && !scheduler->normalInboxes[(size_t)q]->quiescent();
 }
 
 bool Thread::Ready(){
@@ -431,75 +400,6 @@ void Thread::ReleaseFiber(Fiber* f) {
 	CacheFor(f->stackClass).Push(f);
 }
 
-// ---- spares (Config::spareThreads) ----
-
-void Thread::StartSpare(size_t fiberCacheCapacity) {
-	auto go = std::make_shared<std::atomic<bool>>(false);
-	thread = std::thread([this, go, fiberCacheCapacity]() {
-		while (!go->load(std::memory_order_acquire)) std::this_thread::yield();
-		instance  = this;
-		thread_id = epochId;   // a pool slot of its own, after the workers'
-		detail::RunsGates() = true;
-		JLIB_STAT_ONLY(detail::StatLabelThread(-1, "spare");)
-		running.store(true, std::memory_order_release);
-		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Standard);
-		tinyCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Tiny);
-		deepCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Deep);
-		ready.store(true, std::memory_order_release);
-		SpareLoop();
-	});
-	nativeHandle = thread.native_handle();
-	go->store(true, std::memory_order_release);
-}
-
-void Thread::SpareLoop() {
-	while (running.load(std::memory_order_acquire)) {
-		const int q = adoptSlot.load(std::memory_order_seq_cst);
-		if (q >= 0) {
-			// Announce, recheck, pop ONE, release -- then run. Holding `draining` across the run
-			// would make a returning owner wait out a whole task (adopt_model.c, DRAIN_ACROSS_RUN).
-			draining.store(q, std::memory_order_seq_cst);
-			std::atomic_thread_fence(std::memory_order_seq_cst);
-			Task* t = nullptr;
-			if (adoptSlot.load(std::memory_order_seq_cst) == q)
-				scheduler->normalInboxes[(size_t)q]->pop(t);
-			draining.store(kAdoptNone, std::memory_order_seq_cst);
-			if (t) { RunHelped(t); continue; }
-		}
-
-		// Nothing to run: sweep this thread's retire bag, then park. Same handshake as a worker:
-		// consume a pending kick, publish PARKED, recheck (the adopted inbox is this thread's queue
-		// while adopted -- adopt_model.c NO_PARK_RECHECK), sleep.
-		Reclaimer::Gate(false, false);
-		int e = WS_NOTIFIED;
-		if (workerState.compare_exchange_strong(e, WS_EMPTY, std::memory_order_seq_cst)) continue;
-		e = WS_EMPTY;
-		if (!workerState.compare_exchange_strong(e, WS_PARKED, std::memory_order_seq_cst)) {
-			int n = WS_NOTIFIED;
-			workerState.compare_exchange_strong(n, WS_EMPTY, std::memory_order_seq_cst);
-			continue;
-		}
-		if (!running.load(std::memory_order_seq_cst) || AdoptedInboxHasWork()) {
-			int p = WS_PARKED;
-			if (!workerState.compare_exchange_strong(p, WS_EMPTY, std::memory_order_seq_cst)) {
-				int n = WS_NOTIFIED;
-				workerState.compare_exchange_strong(n, WS_EMPTY, std::memory_order_seq_cst);
-			}
-			continue;
-		}
-		int sleeping = WS_PARKED;
-		while (workerState.load(std::memory_order_seq_cst) == WS_PARKED && running.load(std::memory_order_acquire)) {
-#if defined(JLIB_PLATFORM_WINDOWS)
-			::WaitOnAddress(&workerState, &sleeping, sizeof(int), INFINITE);
-#elif JLIB_PLATFORM_LINUX
-			FutexWait(&workerState, sleeping);
-#endif
-		}
-		int got = WS_NOTIFIED;
-		workerState.compare_exchange_strong(got, WS_EMPTY, std::memory_order_seq_cst);
-	}
-}
-
 // ---- main's helper (MainMode::OutOfPool) ----
 
 void Thread::AdoptAsHelper() {
@@ -510,6 +410,10 @@ void Thread::AdoptAsHelper() {
 	ready.store(true, std::memory_order_release);
 }
 
+// UNUSED since main stopped stealing out of the pool (see OutOfPoolMainWait). Kept out of the
+// build rather than deleted: RunHelped below is still the path that resumes a Pin::Main task on
+// main, and this is the only other caller shape it ever had.
+#if 0
 // One steal from one victim per call (round-robin), any stealable task. Bounded by the caller.
 bool Thread::HelpSteal() {
 	const int nq = (int)scheduler->deques.size();
@@ -528,8 +432,9 @@ bool Thread::HelpSteal() {
 	RunHelped(*s);
 	return true;
 }
+#endif
 
-// Runs a stolen task on main. Same dispatch as a worker: coroutines and native tasks directly, fibers
+// Runs a task ON MAIN: a Pin::Main resume out of the pool (RunMainTask hands it here). Same dispatch as a worker: coroutines and native tasks directly, fibers
 // on a fiber from the global pool. A task that suspends here resumes elsewhere: nothing is pinned
 // to the helper (Pin::Current resolves to no pin off the pool).
 void Thread::RunHelped(Task* t) {
@@ -618,18 +523,9 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 		fiberRecycles.fetch_add(1, std::memory_order_relaxed);
 #endif
 		TaskRecord* rec = task_to_run->record;
-		if (rec && rec->owedKinds) {
-			// Holders still owe cleanup: the record (with its fiber) outlives the task and hops to
-			// each holder; the chain recycles the fiber and frees the record at the end.
-			task_to_run->record = nullptr;
-			scheduler->FreeTask(task_to_run);
-			FiberRegistry::Instance().AdvanceCleanup(rec);
-		}
-		else {
-			if (rec) rec->fiber = nullptr;
-			ReleaseFiber(f);
-			scheduler->FreeTask(task_to_run);
-		}
+		if (rec) rec->fiber = nullptr;
+		ReleaseFiber(f);
+		scheduler->FreeTask(task_to_run);
 
 		currentFiber = nullptr;
 		currentRunningTask = nullptr;
@@ -729,8 +625,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 		if (ctx && !task_to_run && ctx->Done()) return mainExit(true);
 
 #if !defined(JLIB_FIBERHOLDER_CTL_NO_WORKER_DRAIN)
-		if (FiberRegistry::Instance().HolderHasWork((size_t)qIndex))
-			FiberRegistry::Instance().DrainHolder((size_t)qIndex);
 #endif  
 
 		const size_t kNow = TaskScheduler::GetHotWorkers();
@@ -970,9 +864,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 		}
 
 		drainOwnInbox();
-		// An adopted inbox (its owner is blocked) is one of this worker's queues: moved onto the
-		// deque, it is run from there next pass and stealable meanwhile.
-		if (!task_to_run && !isReservedWorker && DrainAdoptedInbox()) continue;
 
 		{
 
@@ -1098,7 +989,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 		}
 
 		drainOwnInbox();
-		if (!task_to_run && !isReservedWorker && DrainAdoptedInbox()) continue;
 
 		if (task_to_run) {
 			continue;
@@ -1119,8 +1009,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
-						|| (!isReservedWorker && AdoptedInboxHasWork())
-						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
 						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())))) {
 
 				if (!running.load(std::memory_order_acquire)) break;
@@ -1212,8 +1100,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 							|| scheduler->deques[qIndex]->size_approx() != 0
 							|| hasQueuedWork.load(std::memory_order_seq_cst)
 							|| !scheduler->hiPriInboxes[qIndex]->quiescent()
-							|| !scheduler->normalInboxes[qIndex]->quiescent()
-							|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)) {
+							|| !scheduler->normalInboxes[qIndex]->quiescent()) {
 							mainWait.store(kWaitRunning, std::memory_order_seq_cst);
 							enterHunt();
 							if (!running.load(std::memory_order_acquire)) break;
@@ -1269,10 +1156,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
-						// The adopted inbox is one of this worker's queues while adopted -- load-
-						// bearing, not a courtesy (adopt_model.c: NO_PARK_RECHECK loses a wake).
-						|| (!isReservedWorker && AdoptedInboxHasWork())
-						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
 						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())
 						// Nobody is hunting any more. This worker left the hunt BEFORE it was on
 						// the idle stack, so a LeaveHunt that took `searching` 1->0 in that gap

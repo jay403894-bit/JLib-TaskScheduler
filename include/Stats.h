@@ -25,7 +25,7 @@ namespace JLib {
         StealProbes, StealHits,
         StickyProbes, StickyHits, StealRemoteProbes, SeekProbes, SeekHits,
         WorkFlagWrites,
-        Blocks, BlocksNoAdopter,
+        Blocks,
         HuntEntered,
         Parks, WakesSent,
         Pushes, PushBatches, PushBatchTasks,

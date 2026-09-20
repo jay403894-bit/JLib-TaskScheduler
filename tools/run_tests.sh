@@ -30,8 +30,6 @@ for i in $(seq 1 "$LOOPS"); do
     run SchedulerMainAwayTest x
     run SchedulerThreadScopeTest x
     run SchedulerBlockInPlaceTest x
-    run SchedulerBlockInPlaceTest s
-    run SchedulerBlockInPlaceTest s0
     run SchedulerPforModeTest i
     run SchedulerPforModeTest o
     run SchedulerInboxFairnessTest x
@@ -41,6 +39,8 @@ for i in $(seq 1 "$LOOPS"); do
     run SchedulerBatchTest x
     run SchedulerPinTest x
     run SchedulerPinTest f
+    run SchedulerPinMainTest x
+    run SchedulerPinMainTest m
     run SchedulerRecordTest m
     run SchedulerRecordTest p
     run SchedulerSemCvTest m
@@ -51,6 +51,7 @@ for i in $(seq 1 "$LOOPS"); do
     [ -n "$QUICK" ] && continue
     run SchedulerPeriodicTest m
     run SchedulerPeriodicTest p
+    run SchedulerTimerWakeTest x
     run SchedulerReclaimTest m
     run SchedulerReclaimTest p
     run SchedulerCoroutineTest m

@@ -186,10 +186,20 @@ void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
     }
 }
 
+JLib::TaskDAG::BlockSlot& JLib::TaskDAG::EdgeSlotForThisThread() {
+    Thread* self = Thread::GetCurrent();
+    const size_t outside = edgeSlots.size() - 1;
+    if (!self || !self->IsPoolWorker() || self->qIndex < 0) return edgeSlots[outside];
+    const size_t q = (size_t)self->qIndex;
+    return edgeSlots[q < outside ? q : outside];
+}
+
 JLib::DagEdge* JLib::TaskDAG::AllocEdge() {
+    BlockSlot& slot = EdgeSlotForThisThread();
     for (;;) {
-        // Take the next index in the current block.
-        EdgeBlock* block = currentBlock.load(std::memory_order_acquire);
+        // This thread's own block: the bump is on a line nobody else is writing (except among
+        // threads sharing the outside slot).
+        EdgeBlock* block = slot.cur.load(std::memory_order_acquire);
         if (block) {
             const size_t i = block->used.fetch_add(1, std::memory_order_acq_rel);
             if (i < kEdgesPerBlock) {
@@ -200,20 +210,23 @@ JLib::DagEdge* JLib::TaskDAG::AllocEdge() {
             }
         }
 
-        // Block is full (or there is none yet): install a new one. If another thread installs
-        // first, give ours back and retry in theirs.
-        void* mem = scheduler.GetAllocator()->Alloc();
-        if (!mem) return nullptr;
-        EdgeBlock* fresh = new (mem) EdgeBlock();
-        fresh->prev = block;
+        // Full (or none yet): take a block and chain it for retirement before anyone can use it,
+        // so ~TaskDAG frees it even if this thread never installs it below.
+        EdgeBlock* fresh = new (std::nothrow) EdgeBlock();
+        if (!fresh) return nullptr;
         fresh->used.store(1, std::memory_order_relaxed);   // edges[0] is ours
 
-        if (currentBlock.compare_exchange_strong(block, fresh,
+        EdgeBlock* head = retireHead.load(std::memory_order_relaxed);
+        do {
+            fresh->prev = head;
+        } while (!retireHead.compare_exchange_weak(head, fresh,
+                     std::memory_order_release, std::memory_order_relaxed));
+
+        // Publish it as this slot's current block. A racing thread on the shared outside slot may
+        // install first; ours is already on the retire chain, so retry in theirs and let it go.
+        if (slot.cur.compare_exchange_strong(block, fresh,
                 std::memory_order_acq_rel, std::memory_order_acquire))
             return &fresh->edges[0];
-
-        fresh->~EdgeBlock();
-        scheduler.GetAllocator()->Free(mem);
     }
 }
 
@@ -232,7 +245,8 @@ JLib::TaskDAG::~TaskDAG() {
 #endif
     nodes.clear();
 
-    EdgeBlock* block = currentBlock.load(std::memory_order_acquire);
+    // Every block ever taken is on this chain, whichever thread's slot it ended up in.
+    EdgeBlock* block = retireHead.load(std::memory_order_acquire);
     while (block) {
         EdgeBlock* prev = block->prev;
         em.RetirePtr(block, epoch, &TaskDAG::EdgeBlockDeleter);
@@ -243,9 +257,7 @@ JLib::TaskDAG::~TaskDAG() {
 }
 
 void TaskDAG::EdgeBlockDeleter(void* p) {
-    auto* block = static_cast<EdgeBlock*>(p);
-    block->~EdgeBlock();
-    TaskScheduler::Instance().GetAllocator()->Free(block);
+    delete static_cast<EdgeBlock*>(p);   // heap, not the slab: safe after the pool is gone
 }
 
 void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {

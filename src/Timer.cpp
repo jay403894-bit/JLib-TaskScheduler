@@ -17,6 +17,12 @@
 #include <thread>
 #include <vector>
 
+#if JLIB_PLATFORM_LINUX
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace JLib {
 
     int64_t MonotonicNs() noexcept {
@@ -183,6 +189,11 @@ namespace JLib {
         int64_t  currentTick = 0;
 
         size_t   armedCount = 0;
+        // The tick the timer thread is sleeping toward: INT64_MAX in its untimed wait, kAwake while
+        // it holds the lock or is firing (it recomputes the next event before it sleeps again).
+        // An arm notifies only when its entry makes the next event earlier than this.
+        static constexpr int64_t kAwake = INT64_MIN;
+        int64_t  sleepUntil = kAwake;
         bool     running    = false;
         bool     stopping   = false;
         std::thread worker;
@@ -277,6 +288,7 @@ namespace JLib {
             }
         }
 
+        // May grow `entries` and move every Entry: take an Entry& only after the acquire.
         uint32_t AcquireEntry() {
             if (freeHead != 0) {
                 const uint32_t i = freeHead - 1;
@@ -348,6 +360,16 @@ namespace JLib {
         }
 
         void Run() {
+            // The clock runs above the compute workers, as K does. It is parked nearly always and
+            // brief when it runs, but at normal priority a saturated pool descheduled it for about
+            // a whole 5 ms interval in 2 of 6 measured runs (p99 ~4.8 ms, ~48 grid points skipped);
+            // at high, none in 6 (p99 <= 1.6 ms). The median is set by the OS wake and the 1 ms
+            // tick, not by priority. Best effort on Linux, where a negative nice needs privileges.
+#if JLIB_PLATFORM_WINDOWS
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif JLIB_PLATFORM_LINUX
+            (void)::syscall(SYS_setpriority, PRIO_PROCESS, (int)::syscall(SYS_gettid), -5);
+#endif
             std::unique_lock<std::mutex> lk(m);
             for (;;) {
                 if (stopping) return;
@@ -356,14 +378,20 @@ namespace JLib {
                 if (next < 0) {
                     
                     currentTick = NowTick();
-                    cv.wait(lk);                                
+                    sleepUntil = INT64_MAX;
+                    cv.wait(lk);
+                    sleepUntil = kAwake;
                     continue;
                 }
 
                 const int64_t now = NowTick();
                 if (next > now) {
-                    
-                    cv.wait_for(lk, std::chrono::nanoseconds((next - now) * tickNs));
+                    // Sleep to tick `next`'s boundary. A whole number of ticks counted from `now`
+                    // (a floored tick) lands up to one tick past it: measured ~0.3-0.5 ms later
+                    // idle and about twice as late under load.
+                    sleepUntil = next;
+                    cv.wait_for(lk, std::chrono::nanoseconds((epochNs + next * tickNs) - MonotonicNs()));
+                    sleepUntil = kAwake;
                     continue;
                 }
 
@@ -500,8 +528,14 @@ namespace JLib {
             if (!TaskScheduler::IsInitialized()) { FinishPeriodic(r, false); return; }
             TaskScheduler& s = TaskScheduler::Instance();
             Task* t = s.CreateTask(&RunPeriodic, r, r->lane);
-            if (!t) { FinishPeriodic(r, false); return; }
-            if (!s.Push(t)) { s.FreeTask(t); FinishPeriodic(r, false); }
+            if (!t) { FinishPeriodic(r, false); return; }            // Latency instances go to K's lane intake when there is a K. Everything else (and
+            // latency work with no K) to a compute worker's hi-pri inbox, round-robin with a wake,
+            // as I/O completions do: a normal inbox waits behind the worker's own successors when
+            // the pool is saturated.
+            const bool toK = IsLowLatency(r->lane) && TaskScheduler::HiPriLaneActive()
+                          && s.LaneIntakeEnabled() && TaskScheduler::PushLaneIntake(&t, 1);
+            const bool ok = toK || s.PushTo(t, CorePref::Any, true);
+            if (!ok) { s.FreeTask(t); FinishPeriodic(r, false); }
         }
     };
 
@@ -540,9 +574,11 @@ namespace JLib {
 
         }
 
+        // The deadline's own time rounded UP to a tick, as periodics do: never before now + delay.
+        // Floored now + rounded-up delay could land up to a tick early (more when currentTick has
+        // run a tick ahead of the clock on the empty-fire path).
         const int64_t nowTick = impl->NowTick();
-        const int64_t delayTicks = (delayNs > 0) ? ((delayNs + impl->tickNs - 1) / impl->tickNs) : 0;
-        const int64_t deadlineTick = nowTick + delayTicks;
+        const int64_t deadlineTick = (delayNs > 0) ? impl->TickFor(MonotonicNs() + delayNs) : nowTick;
 
         impl->AdvanceTo(nowTick);
 
@@ -556,8 +592,10 @@ namespace JLib {
         impl->Place(i, deadlineTick);
         ++impl->armedCount;
 
-        const int64_t next = impl->NextEventTick();
-        if (next < 0 || next >= deadlineTick) impl->cv.notify_one();
+        // Wake the sleeper only if this made its next event earlier. Not "next >= deadlineTick":
+        // above level 0 the next event is the entry's cascade boundary, which is before its
+        // deadline, so a 256+ tick timer never woke a thread in its untimed wait.
+        if (impl->NextEventTick() < impl->sleepUntil) impl->cv.notify_one();
 
         return TimerHandle{ (uint64_t(e.generation) << 32) | uint64_t(i) };
     }
@@ -619,8 +657,7 @@ namespace JLib {
         ++im->armedCount;
         r->entry = i;
 
-        const int64_t next = im->NextEventTick();
-        if (next < 0 || next >= e.deadlineTick) im->cv.notify_one();
+        if (im->NextEventTick() < im->sleepUntil) im->cv.notify_one();   // as in Arm
         return Periodic(r);
     }
 
@@ -695,6 +732,7 @@ namespace JLib {
             std::lock_guard<std::mutex> lk(impl->m);
             if (impl->stopping) return;
             impl->stopping = true;
+            impl->running  = false;   // the next Arm after Start spawns a new thread
             impl->cv.notify_all();
             t.swap(impl->worker);
         }

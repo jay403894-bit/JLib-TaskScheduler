@@ -21,7 +21,7 @@ namespace JLib {
             "steal probes into another L3 group",
             "seek probes (flag scan after a cursor miss)", "seek hits",
             "work flag writes (deque empty <-> non-empty)",
-            "blocks (BlockBegin)", "blocks with no free adopter",
+            "blocks (BlockBegin)",
             "hunts entered",
             "parks", "wakes sent",
             "pushes", "push batches", "push batch tasks",

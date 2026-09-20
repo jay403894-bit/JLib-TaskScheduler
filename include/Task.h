@@ -39,20 +39,29 @@ namespace JLib {
     //   Pin::None       resume anywhere: the resumer's own deque (stealable)
     //   Pin::Current    the thread that suspended: its hi-pri inbox (never stolen)
     //   Pin::Thread(n)  worker n: its hi-pri inbox (never stolen)
+    //   Pin::Main       the main thread, in EITHER main mode -- "finish this part on main"
     // Mode::Pinned makes every suspension Current, whatever is passed.
+    //
+    // Pin::Main is its own sentinel because Pin::Thread(0) is main only when main is IN the pool;
+    // out of the pool main is not a worker slot and no index names it. The sentinel carries the
+    // meaning in both modes: main in the pool resumes through slot 0's hi-pri inbox, main out of
+    // it through its own work queue, which ProcessMainThread drains.
     struct Pin {
         static constexpr uint16_t kNone    = 0xFFFF;
         static constexpr uint16_t kCurrent = 0xFFFE;
+        static constexpr uint16_t kMain    = 0xFFFD;
         uint16_t target = kNone;
 
         static const Pin None;
         static const Pin Current;
+        static const Pin Main;
         static constexpr Pin Thread(uint16_t worker) noexcept { return Pin{ worker }; }
         constexpr bool operator==(Pin o) const noexcept { return target == o.target; }
         constexpr bool operator!=(Pin o) const noexcept { return target != o.target; }
     };
     inline constexpr Pin Pin::None{ Pin::kNone };
     inline constexpr Pin Pin::Current{ Pin::kCurrent };
+    inline constexpr Pin Pin::Main{ Pin::kMain };
 
     // Resolves `pin` for the calling thread and writes it into t->record->pinTo. Called only by
     // the suspend primitives (Fiber::BeginSuspend / BeginYield, the coroutine ArmResume).
@@ -93,11 +102,9 @@ namespace JLib {
         Fiber*      fiber       = nullptr;   // body; null until first run
         FiberDebt*  debts       = nullptr;   // cleanup owed at death; each names its holder
         void**      locals      = nullptr;   // task-local slots, allocated on first use
-        TaskRecord* cleanupNext = nullptr;   // link while the dead record hops between holders
         Task*       waitNext    = nullptr;   // link while the task is suspended on a WaitGroup
         uint32_t    generation  = 0;         // bumped on reuse; lets stale references detect it
         uint16_t    pinTo       = kNoPin;    // worker a suspended task must resume on (see Pin)
-        uint8_t     owedKinds   = 0;         // Fiber::OwedKind bits; non-zero means holders must clean up
 #if defined(JLIBSCHED_STATS)
         uint64_t    statFirstRun  = 0;       // clock ticks at first run
         uint64_t    statSuspendAt = 0;       // clock ticks at the last suspension, 0 while running

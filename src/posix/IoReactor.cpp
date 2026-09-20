@@ -152,15 +152,20 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
     auto flush = [&]() {
         if (!TaskScheduler::IsInitialized()) { nHi = nLo = 0; return; }
         auto& s = TaskScheduler::Instance();
-        // Latency completions to the shared lane intake; normal ones, and any the intake refuses,
-        // as a batch spread over the compute workers (never pinned to one slot).
+        // Latency completions to the shared lane intake. Normal ones, and any the intake refuses,
+        // one per compute worker's hi-pri inbox, round-robin with a wake: that inbox is checked
+        // every pass ahead of the worker's own deque, so a busy worker takes it at its next task
+        // boundary (a normal inbox waits behind the worker's own successors; see win32).
+        auto toPool = [&](Task** arr, std::size_t n) {
+            for (std::size_t i = 0; i < n; ++i) s.PushTo(arr[i], CorePref::Any, true);
+        };
         if (nHi) {
             if (!(TaskScheduler::GetHotWorkers() != 0 && s.LaneIntakeEnabled()
                   && TaskScheduler::PushLaneIntake(batchHi, nHi)))
-                s.PushBatch(batchHi, nHi, TaskScheduler::kAnyWorker, 64);
+                toPool(batchHi, nHi);
             nHi = 0;
         }
-        if (nLo) { s.PushBatch(batchLo, nLo, TaskScheduler::kAnyWorker, 64); nLo = 0; }
+        if (nLo) { toPool(batchLo, nLo); nLo = 0; }
     };
 
     for (;;) {

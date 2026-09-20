@@ -394,6 +394,20 @@ struct SlotEpochGuard {
 	}
 
 	~SlotEpochGuard() {
+		// The guard unpins THE SLOT IT PINNED, which is this thread's -- so it must still be this
+		// thread. A guard carried across a suspension and destroyed on another thread would clear
+		// the FIRST thread's slot: if that thread has since opened a guard of its own, it is now
+		// reading protected memory with no pin and its objects can be freed underneath it. The
+		// suspend points all refuse a held guard (JLIB_EPOCH_CHECK_NO_GUARD); this catches any
+		// path that ever gets past them.
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+		if (outermost) {
+			std::atomic<size_t>* mine = EpochManager::Instance().ThreadSlot(CurrentThreadId());
+			assert(mine == slot &&
+			       "an epoch guard was released on a different thread than it was taken on -- a "
+			       "guard must never be held across a suspension (see JLIB_EPOCH_CHECK_NO_GUARD)");
+		}
+#endif
 		if (outermost)
 			slot->store(SIZE_MAX, std::memory_order_release);
 		JLIB_EPOCH_GUARD_LEAVE();

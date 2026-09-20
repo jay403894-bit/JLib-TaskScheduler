@@ -108,7 +108,7 @@ namespace JLib {
 		void AdoptCurrentThread(size_t fiberCacheCapacity);
 		// Main's helper (MainMode::OutOfPool): bind to the calling thread, and steal/run one task.
 		void AdoptAsHelper();
-		bool HelpSteal();
+		// HelpSteal is gone: main does not steal out of the pool (see OutOfPoolMainWait).
 		void RunHelped(Task* t);
         std::thread::id GetID();
 
@@ -179,27 +179,13 @@ namespace JLib {
 
         std::atomic<int> workerState{ 0  };
 
-        // Inbox adoption (TaskScheduler::BlockBegin/End). adoptSlot: kAdoptNone, a qIndex whose
-        // normal inbox this worker drains alongside its own, or kAdoptAway (this thread is blocked in
-        // code it cannot suspend and its inbox is drained by whoever adopted it). draining: the queue
-        // being popped right now; a returning owner waits that out, never a task. Next to workerState
-        // so Wake() reads it from a line it already touches. Model: tests/verify/adopt_model.c.
-        static constexpr int kAdoptNone = -1;
-        static constexpr int kAdoptAway = -2;
-        std::atomic<int> adoptSlot{ kAdoptNone };
-        std::atomic<int> draining{ kAdoptNone };
-        int     blockDepth = 0;         // owner only
-        Thread* adopter    = nullptr;   // owner only: who adopted this thread's inbox (worker or spare)
-
-        // A spare (Config::spareThreads): an OS thread outside the slots, parked until a blocking
-        // thread claims it as adopter. It runs what it pops from the adopted inbox (RunHelped) and
-        // releases `draining` before each run, so a returning owner waits out a pop, never a task.
-        bool isSpare = false;
-        void StartSpare(size_t fiberCacheCapacity);
-        void SpareLoop();
-        // Moves up to one batch from the adopted inbox onto this worker's deque. True if it moved any.
-        bool DrainAdoptedInbox();
-        bool AdoptedInboxHasWork() const;
+        // TaskScheduler::BlockBegin/End: this thread is blocked in code it cannot suspend, so its
+        // slot is busy until the call returns. Nobody stands in for it -- its queued work went onto
+        // the deque before it left (stealable), and unplaced pushes skip an away thread. Work that
+        // may only run here (pinned resumes, PushTo(worker), main-only) waits, by definition.
+        // Next to workerState so a pusher reads it from a line it already touches.
+        std::atomic<bool> away{ false };
+        int blockDepth = 0;
 
         std::atomic<bool> idleLinked{ false };
 

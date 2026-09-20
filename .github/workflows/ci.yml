@@ -113,20 +113,35 @@ jobs:
           run_positive tests/verify/event_model.c
           run_negative -DNO_RELEASE tests/verify/event_model.c
 
-          run_positive tests/verify/counted_epoch_model.c
-          run_positive -DTWO_READERS     tests/verify/counted_epoch_model.c
-          run_negative -DNO_ADVANCE_GATE tests/verify/counted_epoch_model.c
+          # Epoch reclamation as built: slot publish, min-scan, unconditional advance, free at
+          # `epoch < safeEpoch`. (Replaces counted_epoch_model.c, which modelled a ring of sharded
+          # counters this library has never had -- its -DNO_ADVANCE_GATE control guarded an advance
+          # gate that does not exist.)
+          run_positive tests/verify/epoch_model.c
+          run_positive -DTWO_READERS   tests/verify/epoch_model.c
+          run_negative -DPIN_AFTER_READ tests/verify/epoch_model.c
+          run_negative -DNO_MIN_SCAN    tests/verify/epoch_model.c
+          run_negative -DFREE_AT_EQUAL  tests/verify/epoch_model.c
 
-          run_positive tests/verify/sleepwake_model.c
-          run_negative -DACQ_REL_ONLY tests/verify/sleepwake_model.c
-          run_negative -DLANE_ONLY -DWEAK_LANEWAKE tests/verify/sleepwake_model.c
+          # The worker park handshake. (Replaces sleepwake_model.c, whose AWAKE/GOING/SLEEPING
+          # states and recheck-before-publish order do not match WS_EMPTY/WS_NOTIFIED/WS_PARKED
+          # and the publish-then-recheck the code does.)
+          run_positive tests/verify/sleepwake_permit_model.c
+          run_negative -DACQ_REL_ONLY        tests/verify/sleepwake_permit_model.c
+          run_negative -DNO_RECHECK          tests/verify/sleepwake_permit_model.c
+          run_negative -DNO_PREWAIT_REREAD   tests/verify/sleepwake_permit_model.c
+          run_negative -DNO_SPURIOUS_REBLOCK tests/verify/sleepwake_permit_model.c
+          run_negative -DPOSTWAIT_STORE      tests/verify/sleepwake_permit_model.c
+          run_negative -DWAKE_CAS_ONLY       tests/verify/sleepwake_permit_model.c
 
           run_positive tests/verify/fiberwait_model.c
           run_negative -DOLD_ORDERING tests/verify/fiberwait_model.c
 
-          run_positive -DCLEAR_ON_IDLE tests/verify/workerpass_model.c
-          run_positive -DCLEAR_ON_IDLE -DSEARCH_MISS -DRECHECK_FULL tests/verify/workerpass_model.c
-          run_negative -DCLEAR_ON_IDLE -DWAKE_CAS_ONLY tests/verify/workerpass_model.c
+          # The DEFAULT is now the shipping shape (clear on the way to idle, load-then-store).
+          run_positive tests/verify/workerpass_model.c
+          run_positive -DSEARCH_MISS -DRECHECK_FULL tests/verify/workerpass_model.c
+          run_positive -DCLEAR_EXCHANGE tests/verify/workerpass_model.c
+          run_negative -DWAKE_CAS_ONLY tests/verify/workerpass_model.c
 
       - name: GenMC WaitGroup model (safety + liveness)
         run: |
@@ -179,41 +194,8 @@ jobs:
           # The deep pass: ~1.4 M executions, ~12 min single-threaded locally (GenMC 0.18).
           must_pass $M
 
-      # Inbox adoption (BlockInPlace): a blocked thread's inbox drained by a worker or a spare.
-      - name: GenMC adoption model (safety + liveness)
-        run: |
-          docker pull genmc/genmc:v0.17.0
-          M=tests/verify/adopt_model.c
-          run_genmc() {
-            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
-              /usr/local/bin/genmc/genmc --disable-estimation --check-liveness -- "$@" > genmc.out 2>&1
-          }
-          must_pass() {
-            echo "=== $* (expect: no errors) ==="
-            if ! run_genmc "$@"; then tail -30 genmc.out; exit 1; fi
-            grep -m1 'complete executions' genmc.out
-          }
-          must_fail() {
-            echo "=== $* (expect: violation) ==="
-            run_genmc "$@" || true
-            if grep -qE 'INTERNAL|Unknown command line|Error opening' genmc.out || ! grep -qE 'violation' genmc.out; then
-              echo "NEGATIVE CONTROL DID NOT REPORT A VIOLATION: $*"; tail -30 genmc.out; exit 1
-            fi
-            grep -m1 -E 'violation' genmc.out
-          }
-          for V in "" "-DSPARE"; do
-            must_pass $V $M
-            must_pass $V -DPUSHES=2 $M
-            must_pass $V -DRETURNS $M
-            must_pass $V -DRETURNS -DPUSHES=2 $M
-          done
-          must_pass -DTWO_BLOCKERS $M
-          must_fail -DNO_WAKE_REDIRECT $M
-          must_fail -DNO_REDIRECT_FENCE $M
-          must_fail -DNO_PARK_RECHECK -DPUSHES=2 $M
-          must_fail -DRETURNS -DNO_DRAIN_RECHECK $M
-          must_fail -DTWO_BLOCKERS -DEXCHANGE_CLAIM $M
-          must_fail -DSPARE -DRETURNS -DDRAIN_ACROSS_RUN $M
+      # (Inbox adoption was removed: a blocked thread's slot is simply busy until it returns, so
+      # there is no second consumer to model. adopt_model.c went with the mechanism.)
 
       # Linden-Jonsson priority queue (extras/wip/SkipListPQ.h). Same must-report rule as above;
       # PAPER_OBSHEAD shows up as an access past the list rather than an assert.

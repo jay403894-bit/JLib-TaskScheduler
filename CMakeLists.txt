@@ -355,10 +355,12 @@ set(JLIBSCHED_TESTS
     SchedulerMainHelpTest     tests/main_help_test.cpp
     SchedulerMainPushToTest   tests/main_pushto_test.cpp
     SchedulerPeriodicTest     tests/periodic_test.cpp
+    SchedulerTimerWakeTest    tests/timer_wake_test.cpp
     SchedulerPforAllocTest    tests/pfor_alloc_test.cpp
     SchedulerPforModeTest     tests/pfor_mode_test.cpp
     SchedulerInboxFairnessTest tests/inbox_fairness_test.cpp
     SchedulerPinTest          tests/pin_test.cpp
+    SchedulerPinMainTest      tests/pin_main_test.cpp
     SchedulerReclaimTest      tests/reclaim_test.cpp
     SchedulerRecordTest       tests/record_test.cpp
     SchedulerSlotCheckTest    tests/slot_check_test.cpp)

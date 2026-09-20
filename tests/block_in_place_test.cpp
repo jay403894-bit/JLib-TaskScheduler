@@ -1,10 +1,10 @@
-// BlockInPlace on a worker: its normal inbox is adopted by a free worker while it blocks in code
-// that cannot suspend. Model: tests/verify/adopt_model.c.
+// BlockInPlace on a worker: the slot is busy until the call returns and nobody stands in for it.
+// What BlockBegin does is stop the stall from hiding work -- it unloads the normal inbox onto the
+// deque (stealable) and marks the thread away so unplaced pushes pick someone else.
 //
-// 1. A task on worker W blocks for 300 ms; batches pushed straight into W's inbox all run while
-//    W is still blocked (the adopter drains them).
-// 2. More blockers than free adopters: every task still runs exactly once (the ones behind a
-//    blocker with no adopter run after it returns).
+// 1. A task on worker W queues work into its own inbox, then blocks for 300 ms: that work runs
+//    meanwhile (unloaded to the deque), and unplaced pushes run meanwhile too (they skip W).
+// 2. Five of six workers block at once: every task still runs exactly once.
 // 3. Nested BlockInPlace is fine.
 // 4. (child) BlockInPlace inside an EpochGuard is fatal.
 // 5. A native task (CreateNativeTask) runs with no fiber and may BlockInPlace.
@@ -45,8 +45,15 @@ static std::atomic<bool> g_blocking{ false };
 static std::atomic<bool> g_blockerBack{ false };
 static int               g_blockMs = 300;
 
+// Queues work into its OWN inbox, then blocks: BlockBegin must unload that inbox onto the deque,
+// where other workers steal it. Without the unload it would sit unstealable for the whole block.
+static constexpr int kPreQueued = 32;
 static void BlockerBody(void*) {
+	auto& s = TaskScheduler::Instance();
 	g_blockerQ.store(Thread::GetCurrent()->qIndex);
+	Task* ts[kPreQueued];
+	for (int i = 0; i < kPreQueued; ++i) ts[i] = s.CreateTask(&Body, nullptr);
+	s.PushBatch(ts, kPreQueued, (size_t)Thread::GetCurrent()->qIndex, 0);
 	TaskScheduler::BlockInPlace([] {
 		g_blocking.store(true);
 		std::this_thread::sleep_for(std::chrono::milliseconds(g_blockMs));
@@ -61,54 +68,8 @@ static void ManyBlocker(void*) {
 	g_manyBack.fetch_add(1);
 }
 
-// Mode "s": two workers and one spare. Worker B is busy computing, worker A blocks; tasks pushed
-// into A's inbox must run at once -- only the spare is free to take them. Without a spare they
-// would wait for B.
-static std::atomic<bool> g_busyStarted{ false }, g_busyDone{ false };
-static void BusyBody(void*) {
-	g_busyStarted.store(true);
-	const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
-	while (std::chrono::steady_clock::now() < end) {}
-	g_busyDone.store(true);
-}
-// spares == 0 is the control: the same setup must NOT be fast (the tasks wait for worker B).
-static int SpareMode(size_t spares) {
-	TaskScheduler::Config cfg;
-	cfg.workers = 2;
-	cfg.main    = MainMode::OutOfPool;
-	cfg.spareThreads = spares;
-	TaskScheduler::Init(cfg);
-	auto& s = TaskScheduler::Instance();
-	g_blockMs = 400;
-
-	Task* busy = s.CreateTask(&BusyBody, nullptr);
-	Task* blocker = s.CreateTask(&BlockerBody, nullptr);
-	s.PushBatch(&busy, 1, (size_t)1, 0);
-	s.PushBatch(&blocker, 1, (size_t)0, 0);
-	const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while ((!g_blocking.load() || !g_busyStarted.load()) && std::chrono::steady_clock::now() < end)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-	constexpr int kTasks = 32;
-	g_done = 0;
-	Task* ts[kTasks];
-	for (int i = 0; i < kTasks; ++i) ts[i] = s.CreateTask(&Body, nullptr);
-	s.PushBatch(ts, kTasks, (size_t)g_blockerQ.load(), 0);
-	const bool fast = Until(g_done, kTasks, 150) && !g_busyDone.load() && !g_blockerBack.load();
-	std::printf("  both workers occupied, %zu spare(s); %d of %d tasks ran within 150 ms\n", spares, g_done.load(), kTasks);
-	if (spares) Check(fast, "with a spare, a blocked worker's inbox runs while every worker is occupied");
-	else        Check(!fast, "control: with no spare the same tasks wait for a worker (the test can tell)");
-	Until(g_done, kTasks, 5000);
-	while (!g_blockerBack.load() || !g_busyDone.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	std::printf(g_fail ? "RESULT: %d FAILURE(S)\n" : "RESULT: all checks passed\n", g_fail);
-	std::fflush(stdout);
-	std::_Exit(g_fail ? 1 : 0);
-}
-
 int main(int argc, char** argv) {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
-	if (argc > 1 && std::strcmp(argv[1], "s") == 0)  return SpareMode(1);
-	if (argc > 1 && std::strcmp(argv[1], "s0") == 0) return SpareMode(0);
 	TaskScheduler::Config cfg;
 	cfg.workers = 6;
 	cfg.main    = MainMode::OutOfPool;
@@ -144,28 +105,32 @@ int main(int argc, char** argv) {
 
 	// 1 + 3.
 	{
+		g_done = 0;
 		s.Push(s.CreateTask(&BlockerBody, nullptr));
 		const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 		while (!g_blocking.load() && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		const int w = g_blockerQ.load();
-		constexpr int kBatches = 16, kPer = 8;
+
+		// What it had queued when it left is on its deque now: other workers steal and run it.
+		const bool queuedRan = Until(g_done, kPreQueued, 250) && !g_blockerBack.load();
+		std::printf("  worker %d blocked; %d of %d tasks it had queued ran meanwhile\n",
+			w, g_done.load(), kPreQueued);
+		Check(queuedRan, "work queued before the block was unloaded to the deque and stolen");
+
+		// Unplaced pushes skip an away thread, so they run while it is still blocked.
+		constexpr int kUnplaced = 128;
 		g_done = 0;
-		for (int b = 0; b < kBatches; ++b) {
-			Task* ts[kPer];
-			for (int i = 0; i < kPer; ++i) ts[i] = s.CreateTask(&Body, nullptr);
-			s.PushBatch(ts, kPer, (size_t)w, 0);   // straight into the blocked worker's inbox
-		}
-		const bool ranWhileBlocked = Until(g_done, kBatches * kPer, 250) && !g_blockerBack.load();
-		std::printf("  worker %d blocked; %d of %d tasks pushed to its inbox ran meanwhile\n",
-			w, g_done.load(), kBatches * kPer);
-		Check(ranWhileBlocked, "tasks pushed into a blocked worker's inbox ran while it was blocked");
-		Until(g_done, kBatches * kPer, 5000);
+		for (int i = 0; i < kUnplaced; ++i) s.Push(s.CreateTask(&Body, nullptr));
+		const bool unplacedRan = Until(g_done, kUnplaced, 250) && !g_blockerBack.load();
+		std::printf("  %d of %d unplaced tasks ran while it was blocked\n", g_done.load(), kUnplaced);
+		Check(unplacedRan, "unplaced work goes to live threads while one is away");
+
 		const auto end2 = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 		while (!g_blockerBack.load() && std::chrono::steady_clock::now() < end2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		Check(g_blockerBack.load(), "the blocker returned (nested BlockInPlace included)");
 	}
 
-	// 2. Five of six workers block at once: at most half can be adopted.
+	// 2. Five of six workers block at once.
 	{
 		constexpr int kBlockers = 5, kTasks = 400;
 		for (int i = 0; i < kBlockers; ++i) s.Push(s.CreateTask(&ManyBlocker, nullptr));

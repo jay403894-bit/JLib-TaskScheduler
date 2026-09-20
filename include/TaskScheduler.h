@@ -35,7 +35,6 @@
 #include "Event.h"
 namespace JLib {
 	
-	class FiberRegistry;
 	class Thread;
 
 	namespace detail {
@@ -142,13 +141,26 @@ namespace JLib {
 		static void WakeMain() noexcept;
 
 		// Called on a pool thread (main in the pool included) about to block in code it cannot
-		// suspend: a third-party library, a driver call, Present with vsync, a sleep. Its normal
-		// inbox is adopted by a free compute worker, which drains it until BlockEnd, so nothing
-		// pushed to this thread waits for it; its deque was always stealable. Pinned and main-only
-		// work (the hi-pri inbox) still waits -- only this thread may run it. Blocking inside an
-		// EpochGuard is fatal (it would stall reclamation for everyone). Nests; a no-op off the
-		// pool. If no worker is free to adopt (at most half the pool can be adopted at once) the
-		// inbox is moved onto the deque once and later pushes wait. Model: tests/verify/adopt_model.c.
+		// suspend: a third-party library, a driver call, Present with vsync, a sleep.
+		//
+		// THE SLOT IS BUSY UNTIL THE CALL RETURNS -- the pool runs at N-1 meanwhile. Nothing stands
+		// in for this thread: no thread may consume another's inbox (they are single-consumer), and
+		// a stand-in could not run what is here BECAUSE it is here (a pinned resume, work placed for
+		// this thread's identity). What BlockBegin does is stop the stall from hiding work as well:
+		// the normal inbox goes onto the deque, where anyone may steal it, and while this thread is
+		// away it is skipped when unplaced work picks a target. Pinned resumes, PushTo(worker) and
+		// main-only work wait for it, by definition.
+		//
+		// A WAIT YOU OWN DOES NOT BELONG HERE: over ~130-150 us, use a fiber or coroutine and
+		// suspend, which frees the slot properly. This is only for calls that cannot be turned into
+		// a suspension.
+		//
+		// The reason is not only throughput. Reclamation is keyed to THREAD identity: a thread that
+		// is away cannot reach its reclaim gate, so its own retire bag (and the orphans it would
+		// sweep) waits for the call to return -- and an EpochGuard held across the call would stall
+		// reclamation for the whole pool, which is why that is fatal. A suspended fiber costs none
+		// of this: the thread keeps running, keeps gating and keeps its identity live; only the task
+		// is parked. Nests; a no-op off the pool.
 		static void BlockBegin();
 		static void BlockEnd();
 		template <typename F>
@@ -263,6 +275,8 @@ namespace JLib {
 		// The only way a TaskType::Main task is ever queued. Main in the pool: PushTo(0). Main out
 		// of the pool: mainQ push + kick main.
 		void PushMainQueue(Task* task);
+		// Runs one task taken from mainQ: a fresh body, or a Pin::Main resume switched into.
+		void RunMainTask(Task* task);
 		// Main out of the pool: run one mainQ task (false if none).
 		bool RunOneMainTask();
 		// Main out of the pool inside WaitFor: routed work, bounded steals, then park on the group.
@@ -373,8 +387,8 @@ namespace JLib {
 			Mode            mode      = Mode::Migrate;
 			MainMode        main      = MainMode::Default;
 			size_t          workers   = 0;          // 0 = GetSafeTC()
-			// K; at least 1 when io is on. Reserved workers for the latency lane (latency-lane tasks
-			// and latency I/O completions). K never parks: each keeps a core awake (backing off when
+			// K; optional (I/O does not need it). Reserved workers for the latency lane (latency-lane
+			// tasks, and latency I/O completions when K is on). K never parks: each keeps a core awake (backing off when
 			// idle) at high priority, for microsecond pickup even with every compute worker busy;
 			// when its lane is empty it steals compute. With K = 0 latency tasks are placed as
 			// normal work.
@@ -393,11 +407,6 @@ namespace JLib {
 			// Epoch slots for threads outside the pool (ThreadScope), reserved at Init. Only
 			// claimed slots cost anything: an idle one never holds back reclamation.
 			size_t          externalThreads = 16;
-			// Parked OS threads that stand in for a thread blocked in BlockInPlace: a spare adopts
-			// its inbox before any worker does, so the pool keeps its full width while the call
-			// blocks (e.g. Present with vsync every frame). 0 = adoption by workers only, no extra
-			// threads. Not used in Mode::Pinned (a spare is not a slot; nothing can pin to it).
-			size_t          spareThreads = 0;
 			Tunables        tunables;
 		};
 
@@ -471,7 +480,6 @@ namespace JLib {
 
 		static uint16_t AllocFiberLocalSlot() noexcept;
 
-		static FiberRegistry& Fibers() noexcept;
 
 		static bool   HasFiberLocal() noexcept;
 		static void*& FiberLocal(size_t slot) noexcept;
@@ -481,14 +489,10 @@ namespace JLib {
 			return static_cast<T*>(FiberLocal(slot));
 		}
 
+		// Cleanup owed at task death, released by whoever frees the record. There is no
+		// holder-specific form: a dead record does not hop from worker to worker any more.
 		static bool ReleaseOnFiberDeath(FiberDebt& node, void* obj,
 		                                void (*release)(void*) noexcept) noexcept;
-
-		static bool ReleaseOnWorker(FiberDebt& node, void* obj,
-		                            void (*release)(void*) noexcept,
-		                            size_t holder, uint32_t kind) noexcept;
-
-		static size_t DischargeFiberDebts(TaskRecord* r, size_t holder) noexcept;
 
 		// The record of the task running on this thread (fiber or not), or null.
 		static TaskRecord* CurrentRecord() noexcept;
@@ -678,9 +682,6 @@ namespace JLib {
 		
 		bool PushTarget(Task* task, size_t worker = kAnyWorker);
 
-		// Wakes whichever worker has adopted queue q's inbox (Thread::Wake, when q is away).
-		void WakeAdopterOf(int q) noexcept;
-
 		void MaybeBuddyWake(size_t k) noexcept;
 		
 		int PickNextWorker(Lane lane = Lane::Normal);
@@ -789,8 +790,6 @@ namespace JLib {
 		std::vector<Thread*> workers;
 		// MainMode::OutOfPool: main's helper Thread (not in workers; see Thread::isHelper).
 		Thread* mainHelper = nullptr;
-		// Config::spareThreads: parked stand-ins for a thread blocked in BlockInPlace (Thread::isSpare).
-		std::vector<Thread*> spares;
 		TaskMPSCQueue mainQ;
 		std::mutex poolMutex;
 	};

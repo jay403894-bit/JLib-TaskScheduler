@@ -1,6 +1,8 @@
-// TaskRecord step 1b: task-local storage, holder-affine debts, release-on-death. Arg 'p' = Pin mode.
+// TaskRecord: task-local storage and release-on-death debts. Arg 'p' = Pin mode.
+// (Holder-affine debts and the record cleanup hop were removed 2026-09-19: nothing in the library
+// ever created one, and the holder queues they fed cost three checks in the park gate.)
 #include <TaskScheduler.h>
-#include <FiberRegistry.h>
+#include <TaskLocal.h>
 #include <Thread.h>
 #include <atomic>
 #include <chrono>
@@ -43,19 +45,6 @@ static void TlsBody(void* arg) {
 	g_tlsOk.fetch_add(1);
 }
 
-// ---- 2. holder-affine debts ----
-struct DebtCtx { FiberDebt node; int holder; };
-static std::atomic<int> g_hReleased{ 0 }, g_hWrongThread{ 0 };
-static void HolderRelease(void* p) noexcept {
-	auto* c = static_cast<DebtCtx*>(p);
-	if (CurQ() != c->holder) g_hWrongThread.fetch_add(1);
-	g_hReleased.fetch_add(1);
-}
-static void DebtBody(void* p) {
-	auto* c = static_cast<DebtCtx*>(p);
-	TaskScheduler::ReleaseOnWorker(c->node, c, &HolderRelease, (size_t)c->holder, Fiber::kOwesSlab);
-	Thread::CoYield();   // may migrate before dying
-}
 
 // ---- 3. release on death (any holder) ----
 static std::atomic<int> g_anyReleased{ 0 };
@@ -79,7 +68,7 @@ int main(int argc, char** argv) {
 	std::printf("[task-local storage follows the task]\n");
 	{
 		g_slot = TaskScheduler::AllocFiberLocalSlot();
-		FiberRegistry::Instance().SetSlotDeleter(g_slot, &TlsDeleter);
+		SetTaskLocalDeleter(g_slot, &TlsDeleter);
 		const int N = 2000;
 		WaitGroup wg; wg.n.store(N);
 		for (int i = 0; i < N; ++i) {
@@ -93,24 +82,6 @@ int main(int argc, char** argv) {
 		Check(g_tlsOk.load() == N && g_tlsBad.load() == 0, "value survived every yield");
 		Check(g_tlsDeleted.load() == N, "slot deleter ran once per task");
 		if (pin) Check(g_tlsMigrated.load() == 0, "Pin: no task changed worker");
-	}
-
-	std::printf("[debts are released on their holder's thread]\n");
-	{
-		const int N = 2000;
-		std::vector<DebtCtx> ctx(N);
-		WaitGroup wg; wg.n.store(N);
-		for (int i = 0; i < N; ++i) {
-			ctx[i].holder = i % n;
-			Task* t = s.CreateTask(&DebtBody, &ctx[i], Lane::Normal, TaskType::Fiber);
-			t->waitGroup = &wg;
-			s.Push(t);
-		}
-		s.WaitFor(wg);
-		const bool all = WaitFor(g_hReleased, N, 5000);
-		std::printf("  released=%d wrongThread=%d\n", g_hReleased.load(), g_hWrongThread.load());
-		Check(all, "every holder debt was released");
-		Check(g_hWrongThread.load() == 0, "each release ran on its named holder");
 	}
 
 	std::printf("[release-on-death debts]\n");
