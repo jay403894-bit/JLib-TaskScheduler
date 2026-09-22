@@ -73,11 +73,11 @@ static void Holder(void*) {
 			EpochGuard g;
 			r = Ref<Obj>::Acquire(g, g_shared);
 		}
-		if (!r) { g_empty.fetch_add(1); Thread::CoYield(); continue; }
+		if (!r) { g_empty.fetch_add(1); Thread::Yield(); continue; }
 		g_acquired.fetch_add(1);
 		Thread* before = Thread::GetCurrent();
 		for (int y = 0; y < 3; ++y) {
-			Thread::CoYield();
+			Thread::Yield();
 			if (r->magic != 0xA11CE) g_sawDead.fetch_add(1);
 			// Wait on a tiny task sent to ANOTHER worker: in Migrate the resume lands on the worker
 			// that finished it. (A plain Push from a worker stays on its own deque, so the holder
@@ -103,7 +103,7 @@ static void Writer(void*) {
 		Ref<Obj> fresh = Ref<Obj>::Make();
 		Obj* old = g_shared.exchange(fresh.ReleaseToShared());
 		if (old) { Ref<Obj> gone = Ref<Obj>::AdoptFromShared(old); }   // drops the structure's reference
-		Thread::CoYield();
+		Thread::Yield();
 	}
 }
 
@@ -112,7 +112,7 @@ static std::atomic<void*> g_hzSrc{ nullptr };
 static void HazardAcrossYield(void*) {
 	HazardGuard g;
 	g.Protect(0, g_hzSrc);
-	Thread::CoYield();
+	Thread::Yield();
 }
 
 // ---- hazard pointers ----
@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
 		static int dummy = 0;
 		g_hzSrc.store(&dummy);
 		WaitGroup wg; wg.n.store(1);
-		Task* t = s.CreateTask(&HazardAcrossYield, nullptr);
+		Task* t = s.CreateTask(&HazardAcrossYield, nullptr, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &wg; s.Push(t);
 		s.WaitFor(wg);
 		std::printf("CHILD DID NOT ABORT\n");
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
 		const int N = 64;
 		wg.n.store(N * 2);
 		for (int i = 0; i < N; ++i) {
-			Task* f = s.CreateTask(&RetireSome, (void*)(intptr_t)(i * 7 + 1));   // fiber
+			Task* f = s.CreateTask(&RetireSome, (void*)(intptr_t)(i * 7 + 1), Lane::Normal, TaskType::Fiber);   // fiber
 			f->waitGroup = &wg; s.Push(f);
 			Task* l = s.CreateTask([i] { RetireSome((void*)(intptr_t)(i * 5 + 1)); });   // direct lambda
 			l->waitGroup = &wg; s.Push(l);
@@ -216,11 +216,11 @@ int main(int argc, char** argv) {
 	{
 		{ Ref<Obj> first = Ref<Obj>::Make(); g_shared.store(first.ReleaseToShared()); }
 		WaitGroup wwg; wwg.n.store(2);
-		for (int i = 0; i < 2; ++i) { Task* w = s.CreateTask(&Writer, nullptr); w->waitGroup = &wwg; s.Push(w); }
+		for (int i = 0; i < 2; ++i) { Task* w = s.CreateTask(&Writer, nullptr, Lane::Normal, TaskType::Fiber); w->waitGroup = &wwg; s.Push(w); }
 		WaitGroup hwg;
 		const int H = 64;
 		hwg.n.store(H);
-		for (int i = 0; i < H; ++i) { Task* h = s.CreateTask(&Holder, nullptr); h->waitGroup = &hwg; s.Push(h); }
+		for (int i = 0; i < H; ++i) { Task* h = s.CreateTask(&Holder, nullptr, Lane::Normal, TaskType::Fiber); h->waitGroup = &hwg; s.Push(h); }
 		s.WaitFor(hwg);
 		g_stopWriter.store(true);
 		s.WaitFor(wwg);

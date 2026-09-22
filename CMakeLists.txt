@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-set(JLIBSCHED_VERSION "1.2.0")
+set(JLIBSCHED_VERSION "1.4.0")
 
 option(JLIBSCHED_STATS "Per-thread scheduler counters and timing histograms (diagnostic build)" OFF)
 option(JLIBSCHED_RETRY_STATS "Record CAS retries per call -- max and buckets, not an average (diagnostic; sits inside CAS loops)" OFF)
@@ -33,12 +33,12 @@ if(JLIBSCHED_STANDALONE)
                     "Windows on ARM64 needs CMake 3.26+ for the ASM_MARMASM language (armasm64). "
                     "Found ${CMAKE_VERSION}.")
             endif()
-            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MARMASM)
+            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES C CXX ASM_MARMASM)
         else()
-            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MASM)
+            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES C CXX ASM_MASM)
         endif()
     else()
-        project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM)
+        project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES C CXX ASM)
     endif()
 
     get_property(_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -139,8 +139,16 @@ if(JLIBSCHED_TSAN)
                    "until __tsan_switch_to_fiber annotations exist; see the option's comment")
 endif()
 
-add_library(Scheduler STATIC ${JLIBSCHED_SRC} ${JLIBSCHED_PLAT} ${JLIBSCHED_ASM})
+# mimalloc (third_party/mimalloc, vendored unmodified, MIT): built as ONE translation unit --
+# src/static.c #includes the whole allocator -- so its own CMake is not needed. Used through
+# explicit heaps only; the library never overrides malloc/new (that is the application's call).
+set(JLIBSCHED_MIMALLOC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mimalloc/src/static.c")
+
+add_library(Scheduler STATIC ${JLIBSCHED_SRC} ${JLIBSCHED_PLAT} ${JLIBSCHED_ASM} ${JLIBSCHED_MIMALLOC})
 add_library(JLib::Scheduler ALIAS Scheduler)
+# Private: the scheduler's .cpp files include <mimalloc.h>; consumers don't need it.
+target_include_directories(Scheduler PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/mimalloc/include>)
 
 if(JLIBSCHED_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STATS=1)
@@ -347,6 +355,7 @@ set(JLIBSCHED_TESTS
     SchedulerMainAwayTest     tests/main_away_test.cpp
     SchedulerThreadScopeTest  tests/thread_scope_test.cpp
     SchedulerBlockInPlaceTest tests/block_in_place_test.cpp
+    SchedulerFiberExceptionTest tests/fiber_exception_test.cpp
     SchedulerFiberGrowTest    tests/fiber_grow_test.cpp
     SchedulerFtlTest          tests/ftl_test.cpp
     SchedulerHangHuntTest     tests/hang_hunt_test.cpp
@@ -361,9 +370,17 @@ set(JLIBSCHED_TESTS
     SchedulerInboxFairnessTest tests/inbox_fairness_test.cpp
     SchedulerPinTest          tests/pin_test.cpp
     SchedulerPinMainTest      tests/pin_main_test.cpp
+    SchedulerPumpMainTest     tests/pump_main_test.cpp
+    SchedulerMemoryTest       tests/memory_test.cpp
+    SchedulerHomeAllocTest    tests/home_alloc_test.cpp
+    SchedulerWorkerLocalTest  tests/worker_local_test.cpp
+    SchedulerEventDeadlineTest tests/event_deadline_test.cpp
     SchedulerReclaimTest      tests/reclaim_test.cpp
     SchedulerRecordTest       tests/record_test.cpp
     SchedulerSlotCheckTest    tests/slot_check_test.cpp)
+if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND JLIBSCHED_TESTS SchedulerIoFiberTest tests/io_fiber_test.cpp)   # C++17: fibers, no coroutines
+endif()
 
 if(JLIBSCHED_COROUTINES)
     list(APPEND JLIBSCHED_TESTS

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause
+﻿// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
 // Pin::Main: a task suspends on a worker and RESUMES ON THE MAIN THREAD, so the tail of one task
@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
 		// PushTo, not Push: a hi-pri inbox is never stolen, so the head is guaranteed to start on
 		// worker 1 (never main, which is slot 0 in pool and a stealing helper out of it). Without
 		// that, main steals the task inside its own WaitFor and the test proves nothing.
-		s.PushTo(1, s.CreateTask(&Waiter, nullptr));
+		s.PushTo(1, s.CreateTask(&Waiter, nullptr, Lane::Normal, TaskType::Fiber));
 		// The release must come from a task that sleeps first. Completing the group from main as
 		// soon as the waiter says it is about to wait is a race: WaitFor's fast path returns
 		// without suspending if the count is already zero, and then there is no resume to pin --
@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
 		outer.n.store(1);
 		g_outer = &outer;
 		g_resumes = 0;
-		s.Push(s.CreateTask(&TwoHop, nullptr));
+		s.Push(s.CreateTask(&TwoHop, nullptr, Lane::Normal, TaskType::Fiber));
 		s.WaitFor(outer);
 		Check(g_resumes.load() == 1, "two suspensions in a row both resumed on main");
 	}

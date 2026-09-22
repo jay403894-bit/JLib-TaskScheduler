@@ -122,7 +122,7 @@ static void MainBlocking(void*) {
 		t->waitGroup = &inner;
 		s.Push(t);
 	}
-	s.WaitFor(inner);
+	s.WaitFor(inner, Pin::Main);   // PushMain only chose where it started; the wait says where it resumes
 	if (before && OnMain()) g_blockMainOk.fetch_add(1); else g_blockMainBad.fetch_add(1);
 }
 static void PostBlockingToMain(void* p) {
@@ -206,8 +206,11 @@ int main(int argc, char** argv) {
 		Check(g_onMain.load() > 0, "main took part");
 	}
 
-	g_stageSeq = 4; Stage("PushMain from workers, Native and Fiber");
-	for (TaskType ty : { TaskType::Fiber, TaskType::Fiber }) {
+	// PushMain keeps the type it is given: a Fiber task gets a fiber on main, a Native one runs
+	// straight on main's stack. Both must land on main.
+	for (TaskType ty : { TaskType::Fiber, TaskType::Native }) {
+	g_stageSeq = 4; Stage(ty == TaskType::Fiber ? "PushMain from workers (Fiber)" : "PushMain from workers (Native)");
+	{
 		g_mainTaskRan = 0; g_mainTaskWrong = 0;
 		const int per = 50, posters = 8;
 		WaitGroup wg; wg.n.store(per * posters + posters);
@@ -218,12 +221,17 @@ int main(int argc, char** argv) {
 			s.PushTo(1 + (size_t)i % (n - 1), t);
 		}
 		s.WaitFor(wg);
-		std::printf("  %s: on main=%d, elsewhere=%d\n", ty == TaskType::Fiber ? "fiber" : "native", g_mainTaskRan.load(), g_mainTaskWrong.load());
+		std::printf("  on main=%d, elsewhere=%d\n", g_mainTaskRan.load(), g_mainTaskWrong.load());
 		Check(g_mainTaskRan.load() == per * posters && g_mainTaskWrong.load() == 0, "every PushMain task ran on main");
 	}
+	}
 
-	g_stageSeq = 41; Stage("PushMain tasks that block in WaitFor stay on main");
-	for (TaskType ty : { TaskType::Fiber, TaskType::Fiber }) {
+	// Fiber: suspends, and Pin::Main brings the resume back. Native: cannot suspend -- main's wait
+	// helps the pool on main's own stack instead, so it never leaves main at all.
+	for (TaskType ty : { TaskType::Fiber, TaskType::Native }) {
+	g_stageSeq = 41; Stage(ty == TaskType::Fiber ? "PushMain tasks that WaitFor(Pin::Main) stay on main (Fiber)"
+	                                             : "PushMain tasks that WaitFor stay on main (Native: main helps)");
+	{
 		g_blockMainOk = 0; g_blockMainBad = 0;
 		const int per = 10, posters = 4;
 		WaitGroup wg; wg.n.store(per * posters + posters);
@@ -234,9 +242,10 @@ int main(int argc, char** argv) {
 			s.PushTo(1 + (size_t)i % (n - 1), t);
 		}
 		s.WaitFor(wg);
-		std::printf("  created as %s: stayed on main=%d, left main=%d\n",
-			ty == TaskType::Fiber ? "Fiber" : "Native", g_blockMainOk.load(), g_blockMainBad.load());
+		std::printf("  stayed on main=%d, left main=%d\n",
+			g_blockMainOk.load(), g_blockMainBad.load());
 		Check(g_blockMainOk.load() == per * posters && g_blockMainBad.load() == 0, "blocking main tasks never left main");
+	}
 	}
 
 	g_stageSeq = 5; Stage("suspending fibers (some on main)");

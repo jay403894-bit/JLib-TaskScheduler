@@ -19,7 +19,7 @@
 namespace JLib {
 
     enum class Stat : std::uint8_t {
-        RunOwnDeque, RunInbox, RunHiPri, RunStolen, RunMainQueue, RunLaneIntake, RunHelper,
+        RunOwnDeque, RunInbox, RunHiPri, RunStolen, RunMainQueue, RunInjector, RunHelper,
         RunLambda, RunFiber, RunCoroutine,
         InboxStaged,
         StealProbes, StealHits,

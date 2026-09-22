@@ -59,8 +59,18 @@ for i in $(seq 1 "$LOOPS"); do
     run SchedulerFutureTest m
     run SchedulerIoAsyncTest m
     run SchedulerIoAsyncTest p
+    run SchedulerIoAsyncTest k
+    run SchedulerIoAsyncTest pk
+    run SchedulerIoFiberTest m
+    run SchedulerIoFiberTest p
+    run SchedulerIoFiberTest k
+    run SchedulerIoFiberTest pk
     run SchedulerFiberGrowTest x
     run SchedulerFiberGrowTest l
+    run SchedulerFiberExceptionTest x
+    run SchedulerHomeAllocTest x
+    run SchedulerWorkerLocalTest x
+    run SchedulerEventDeadlineTest x
     run SchedulerLambdaSuspendTest x
     run SchedulerHangHuntTest x
     run SchedulerSlotCheckTest x

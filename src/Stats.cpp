@@ -13,7 +13,7 @@ namespace JLib {
     const char* StatName(Stat s) noexcept {
         static const char* const k[kStatCount] = {
             "run: own deque", "run: inbox", "run: hi-pri inbox", "run: stolen", "run: main queue",
-            "run: lane intake", "run: main helper",
+            "run: injector", "run: main helper",
             "run: lambda", "run: fiber", "run: coroutine",
             "inbox staged to deque",
             "steal probes", "steal hits",

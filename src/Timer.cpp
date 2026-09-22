@@ -25,14 +25,17 @@
 
 namespace JLib {
 
+    // Nothing armed until something arms it, so workers take the cheap branch from the start.
+    namespace detail { std::atomic<int64_t> g_timerGateNs{ INT64_MAX }; }
+
     int64_t MonotonicNs() noexcept {
         using namespace std::chrono;
         return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
+    // Only the waiters inside the expiring token: the others on the same event keep waiting.
     void EjectEvent(void* ctx, CancelToken token) {
-        if (ctx) static_cast<Event*>(ctx)->CancelWaiters();
-        (void)token;   
+        if (ctx) static_cast<Event*>(ctx)->CancelWaiters(token);
     }
 
     void EjectSemaphore(void* ctx, CancelToken token) {
@@ -194,6 +197,14 @@ namespace JLib {
         // An arm notifies only when its entry makes the next event earlier than this.
         static constexpr int64_t kAwake = INT64_MIN;
         int64_t  sleepUntil = kAwake;
+
+        // Recompute the advisory worker gate (detail::g_timerGateNs -- see Timer.h) from the wheel.
+        // Call with `m` held, after anything that can change the next event: arm, disarm, fire.
+        void PublishGateLocked() noexcept {
+            const int64_t next = NextEventTick();
+            detail::g_timerGateNs.store(next < 0 ? INT64_MAX : epochNs + next * tickNs,
+                                        std::memory_order_relaxed);
+        }
         bool     running    = false;
         bool     stopping   = false;
         std::thread worker;
@@ -395,52 +406,80 @@ namespace JLib {
                     continue;
                 }
 
-                AdvanceTo(next);
-
-                constexpr size_t kBatch = 64;
-                CancelToken tokens[kBatch];
-                TimerEject  ejects[kBatch];
-                void*       ctxs[kBatch];
-                size_t      n = 0;
-                PeriodicRecord* fired[kBatch];
-                size_t      nf = 0;
-
-                const uint32_t slot = uint32_t(currentTick & kSlotMask);
-                uint32_t idx = heads[0][slot];
-                while (idx != kNil && n + nf < kBatch) {
-                    const uint32_t nextIdx = entries[idx].next;
-                    Entry& e = entries[idx];
-
-                    if (e.deadlineTick <= currentTick && e.periodic) {
-                        if (FirePeriodicLocked(idx)) fired[nf++] = e.periodic;
-                    } else if (e.deadlineTick <= currentTick) {
-                        tokens[n] = CancelToken(e.token);
-                        ejects[n] = e.eject;
-                        ctxs[n]   = e.ctx;
-                        ++n;
-
-                        Unlink(idx);
-                        ++e.generation;              
-                        ReleaseEntry(idx);
-                        --armedCount;
-                    }
-                    idx = nextIdx;
-                }
-
-                if (n == 0 && nf == 0) {
-
-                    ++currentTick;
-                    continue;
-                }
-
-                lk.unlock();
-                for (size_t i = 0; i < n; ++i) {
-
-                    if (CancelVia(tokens[i]) && ejects[i]) ejects[i](ctxs[i], tokens[i]);
-                }
-                for (size_t i = 0; i < nf; ++i) LaunchPeriodic(fired[i]);
-                lk.lock();
+                FireStepLocked(lk, next);
             }
+        }
+
+        // ONE step of the wheel: advance to `next`, take what that tick holds, then dispatch with
+        // the lock DROPPED (an eject or a periodic body must never run under `m`). Enters and
+        // leaves with `lk` held, and republishes the gate before returning.
+        //
+        // Factored out of Run() so the timer thread and a polling worker run the same code: two
+        // copies of a wheel walk that must agree is how the two drift apart.
+        void FireStepLocked(std::unique_lock<std::mutex>& lk, int64_t next) {
+            AdvanceTo(next);
+
+            constexpr size_t kBatch = 64;
+            CancelToken tokens[kBatch];
+            TimerEject  ejects[kBatch];
+            void*       ctxs[kBatch];
+            size_t      n = 0;
+            PeriodicRecord* fired[kBatch];
+            size_t      nf = 0;
+
+            const uint32_t slot = uint32_t(currentTick & kSlotMask);
+            uint32_t idx = heads[0][slot];
+            while (idx != kNil && n + nf < kBatch) {
+                const uint32_t nextIdx = entries[idx].next;
+                Entry& e = entries[idx];
+
+                if (e.deadlineTick <= currentTick && e.periodic) {
+                    if (FirePeriodicLocked(idx)) fired[nf++] = e.periodic;
+                } else if (e.deadlineTick <= currentTick) {
+                    tokens[n] = CancelToken(e.token);
+                    ejects[n] = e.eject;
+                    ctxs[n]   = e.ctx;
+                    ++n;
+
+                    Unlink(idx);
+                    ++e.generation;
+                    ReleaseEntry(idx);
+                    --armedCount;
+                }
+                idx = nextIdx;
+            }
+
+            if (n == 0 && nf == 0) {
+
+                ++currentTick;
+                PublishGateLocked();
+                return;
+            }
+
+            lk.unlock();
+            for (size_t i = 0; i < n; ++i) {
+
+                if (CancelVia(tokens[i]) && ejects[i]) ejects[i](ctxs[i], tokens[i]);
+            }
+            for (size_t i = 0; i < nf; ++i) LaunchPeriodic(fired[i]);
+            lk.lock();
+            PublishGateLocked();
+        }
+
+        // Called from the worker loop when the gate says something is due. NEVER BLOCKS: if the
+        // lock is held, someone else is already firing and this worker goes back to its own work.
+        // The timer thread remains the backstop, so a miss here costs latency, never a lost timer.
+        bool PollFire() {
+            std::unique_lock<std::mutex> lk(m, std::try_to_lock);
+            if (!lk.owns_lock()) return false;
+            if (stopping) return false;
+
+            const int64_t next = NextEventTick();
+            if (next < 0) { PublishGateLocked(); return false; }
+            if (next > NowTick()) { PublishGateLocked(); return false; }
+
+            FireStepLocked(lk, next);
+            return true;
         }
 
         // ---- periodic tasks ----
@@ -528,12 +567,12 @@ namespace JLib {
             if (!TaskScheduler::IsInitialized()) { FinishPeriodic(r, false); return; }
             TaskScheduler& s = TaskScheduler::Instance();
             Task* t = s.CreateTask(&RunPeriodic, r, r->lane);
-            if (!t) { FinishPeriodic(r, false); return; }            // Latency instances go to K's lane intake when there is a K. Everything else (and
+            if (!t) { FinishPeriodic(r, false); return; }            // Latency instances go to the injector when there is a K. Everything else (and
             // latency work with no K) to a compute worker's hi-pri inbox, round-robin with a wake,
             // as I/O completions do: a normal inbox waits behind the worker's own successors when
             // the pool is saturated.
             const bool toK = IsLowLatency(r->lane) && TaskScheduler::HiPriLaneActive()
-                          && s.LaneIntakeEnabled() && TaskScheduler::PushLaneIntake(&t, 1);
+                          && s.InjectorEnabled() && TaskScheduler::PushInjector(&t, 1);
             const bool ok = toK || s.PushTo(t, CorePref::Any, true);
             if (!ok) { s.FreeTask(t); FinishPeriodic(r, false); }
         }
@@ -549,9 +588,16 @@ namespace JLib {
     }
 
     TimerQueue& TimerQueue::Instance() {
-        
+
         static TimerQueue* q = new TimerQueue();
         return *q;
+    }
+
+    // The gate is INT64_MAX until the first arm, and an arm is what constructs the queue -- so a
+    // worker that reaches here has already seen a deadline published, and Instance() cannot be
+    // the thing that builds it.
+    bool TimerPollFire() noexcept {
+        return TimerQueue::Instance().impl->PollFire();
     }
 
     TimerHandle TimerQueue::Arm(int64_t delayNs, CancelToken token, TimerEject eject, void* ctx) {
@@ -597,6 +643,8 @@ namespace JLib {
         // deadline, so a 256+ tick timer never woke a thread in its untimed wait.
         if (impl->NextEventTick() < impl->sleepUntil) impl->cv.notify_one();
 
+        impl->PublishGateLocked();   // workers see the new deadline without waking anyone
+
         return TimerHandle{ (uint64_t(e.generation) << 32) | uint64_t(i) };
     }
 
@@ -613,9 +661,10 @@ namespace JLib {
         if (e.generation != g || (g & 1u) == 0) return false;
 
         impl->Unlink(i);
-        ++e.generation;                       
+        ++e.generation;
         impl->ReleaseEntry(i);
         --impl->armedCount;
+        impl->PublishGateLocked();   // this may have been the earliest deadline
         return true;
     }
 
@@ -658,6 +707,7 @@ namespace JLib {
         r->entry = i;
 
         if (im->NextEventTick() < im->sleepUntil) im->cv.notify_one();   // as in Arm
+        im->PublishGateLocked();
         return Periodic(r);
     }
 
@@ -682,6 +732,7 @@ namespace JLib {
         TimerQueue::Impl* im = TimerQueue::Instance().impl;
         std::lock_guard<std::mutex> lk(im->m);
         im->CancelPeriodicLocked(rec_);
+        im->PublishGateLocked();
     }
 
     void Periodic::Join() {
@@ -733,6 +784,8 @@ namespace JLib {
             if (impl->stopping) return;
             impl->stopping = true;
             impl->running  = false;   // the next Arm after Start spawns a new thread
+            // Shut the gate: a worker must not walk the wheel while the queue is tearing down.
+            detail::g_timerGateNs.store(INT64_MAX, std::memory_order_relaxed);
             impl->cv.notify_all();
             t.swap(impl->worker);
         }

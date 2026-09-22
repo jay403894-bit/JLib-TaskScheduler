@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause
+﻿// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 // SchedulerBench: named workloads, each run as fiber tasks and as coroutines where both apply.
@@ -61,7 +61,7 @@ std::uint64_t PushAndWait(void (*fn)(void*), void* arg, int n) {
     WaitGroup wg;
     wg.n.store(n);
     for (int i = 0; i < n; ++i) {
-        Task* t = S().CreateTask(fn, arg);
+        Task* t = S().CreateTask(fn, arg, Lane::Normal, TaskType::Fiber);
         t->waitGroup = &wg;
         S().Push(t);
     }
@@ -102,7 +102,7 @@ std::uint64_t Batch(TaskScheduler::BatchSpread spread) {
     for (int done = 0; done < kSpawnN; done += kBatch) {
         const int n = std::min(kBatch, kSpawnN - done);
         for (int i = 0; i < n; ++i) {
-            tasks[i] = S().CreateTask(&Nop, nullptr);
+            tasks[i] = S().CreateTask(&Nop, nullptr, Lane::Normal, TaskType::Fiber);
             tasks[i]->waitGroup = &wg;
         }
         S().PushBatch(tasks.data(), (size_t)n, spread);
@@ -243,8 +243,8 @@ void FibTask(void* p) {
     FibArgs x{ a->n - 1, 0 }, y{ a->n - 2, 0 };
     WaitGroup wg;
     wg.n.store(2);
-    Task* tx = S().CreateTask(&FibTask, &x); tx->waitGroup = &wg; S().Push(tx);
-    Task* ty = S().CreateTask(&FibTask, &y); ty->waitGroup = &wg; S().Push(ty);
+    Task* tx = S().CreateTask(&FibTask, &x, Lane::Normal, TaskType::Fiber); tx->waitGroup = &wg; S().Push(tx);
+    Task* ty = S().CreateTask(&FibTask, &y, Lane::Normal, TaskType::Fiber); ty->waitGroup = &wg; S().Push(ty);
     S().WaitFor(wg);
     a->result = x.result + y.result;
 }
@@ -314,7 +314,7 @@ std::uint64_t CasePingPong(Kind k) {
 
 // yield: each task yields repeatedly.
 constexpr int kYieldTasks = 64, kYieldIters = 2000;
-void YieldTask(void*) { for (int i = 0; i < kYieldIters; ++i) Thread::CoYield(); }
+void YieldTask(void*) { for (int i = 0; i < kYieldIters; ++i) Thread::Yield(); }
 Coro YieldCoro() { for (int i = 0; i < kYieldIters; ++i) co_await Reschedule{}; }
 std::uint64_t CaseYield(Kind k) {
     if (k == Kind::Fiber) PushAndWait(&YieldTask, nullptr, kYieldTasks);
@@ -427,12 +427,12 @@ std::uint64_t CaseLockMix(Kind) {
     compute.n.store(kMixCompute);
     const auto t0 = Clock::now();
     for (int i = 0; i < kLockTasks; ++i) {
-        Task* t = S().CreateTask(&LockTask, nullptr);
+        Task* t = S().CreateTask(&LockTask, nullptr, Lane::Normal, TaskType::Fiber);
         t->waitGroup = &contend;
         S().Push(t);
     }
     for (int i = 0; i < kMixCompute; ++i) {
-        Task* t = S().CreateTask(&MixCompute, nullptr);
+        Task* t = S().CreateTask(&MixCompute, nullptr, Lane::Normal, TaskType::Fiber);
         t->waitGroup = &compute;
         S().Push(t);
     }
@@ -451,7 +451,7 @@ std::uint64_t CaseDag(Kind) {
     WaitGroup wg;
     wg.n.store(kDagN + 2);
     TaskDAG dag(S());
-    auto make = [&wg]() { Task* t = S().CreateTask(&Nop, nullptr); t->waitGroup = &wg; return t; };
+    auto make = [&wg]() { Task* t = S().CreateTask(&Nop, nullptr, Lane::Normal, TaskType::Fiber); t->waitGroup = &wg; return t; };
     auto* root = dag.CreateNode(make());
     auto* join = dag.CreateNode(make());
     for (int i = 0; i < kDagN; ++i) {
@@ -492,7 +492,7 @@ std::uint64_t CaseLatency(Kind k) {
         WaitGroup wg;
         const std::int64_t t0 = NowNs();
         if (k == Kind::Fiber) {
-            Task* t = S().CreateTask(&LatTask, nullptr);
+            Task* t = S().CreateTask(&LatTask, nullptr, Lane::Normal, TaskType::Fiber);
             if (mainInPool) { wg.n.store(1); t->waitGroup = &wg; }
             S().Push(t);
         }
@@ -668,7 +668,7 @@ void Usage() {
         "  --threads N                 pool size (default: the scheduler's choice)\n"
         "  --k N                       reserved (hot) workers\n"
         "  --timers                    start the timer thread (enables: periodic)\n"
-        "  --io                        start the I/O reactor (implies --timers and K >= 2; enables: io)\n"
+        "  --io                        start the I/O reactor after Init (enables: io)\n"
         "  --kind fiber|coro|both      which task kind to run where both apply (default both)\n"
         "  --cases a,b,...             only these cases\n"
         "  --reps N                    timed repetitions per case (default 5, after one warmup)\n"
@@ -746,7 +746,7 @@ void RunOne(const Options& o, const Case& c, Kind kind, std::FILE* csv) {
         std::fprintf(csv, "%s,%s,%s,%s,%zu,%zu,%d,%d,%s,%s,%llu,%d,%.4f,%.4f,%.4f,%.1f,%.2f,%.2f\n",
                      JLIBSCHED_VERSION_STRING, Stats::Enabled() ? "stats" : "release",
                      ModeName(o.mode), MainName(o.main), S().GetWorkerCount(), TaskScheduler::GetHotWorkers(),
-                     (int)TaskScheduler::TimersEnabled(), (int)TaskScheduler::IoReactorEnabled(),
+                     (int)TaskScheduler::TimersEnabled(), (int)(o.io && IoReactor::IsAvailable()),
                      c.name, KindName(kind), (unsigned long long)ops, o.reps, med, ms.front(), ms.back(),
                      opsPerSec,
                      c.run == &CaseLatency ? g_latP50 : 0.0, c.run == &CaseLatency ? g_latP99 : 0.0);
@@ -823,8 +823,8 @@ int main(int argc, char** argv) {
     cfg.workers    = o.threads;
     cfg.hotWorkers = o.k;
     cfg.timers     = o.timers;
-    cfg.io         = o.io;
     TaskScheduler::Init(cfg);
+    if (o.io && IoReactor::IsAvailable()) IoReactor::Instance().Start();   // I/O is opt-in
 
     std::FILE* csv = nullptr;
     if (!o.csv.empty()) {
@@ -838,7 +838,7 @@ int main(int argc, char** argv) {
     }
 
     const bool timers = TaskScheduler::TimersEnabled();
-    const bool io = TaskScheduler::IoReactorEnabled() && IoReactor::IsAvailable();
+    const bool io = o.io && IoReactor::IsAvailable();
     if (o.header)
         std::printf("JLib::Scheduler %s bench (%s)\n", JLIBSCHED_VERSION_STRING,
                     Stats::Enabled() ? "stats build -- timings are not comparable with a release build" : "release build");

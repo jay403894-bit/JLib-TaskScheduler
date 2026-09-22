@@ -84,16 +84,36 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <!-- MUST stay equal to CMakeLists.txt's glob of src\*.cpp plus one platform dir. The two build
+         systems compile the same library, and a file listed in one and missing from the other is a
+         half-built library: this list was missing Hazard, IoShared, Reclaimer, Stats and TaskLocal,
+         which is an epoch/reclaim layer that is simply absent. -->
     <ClCompile Include="src\CancelToken.cpp" />
+    <ClCompile Include="src\Memory.cpp">
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\mimalloc\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <!-- mimalloc, vendored unmodified (MIT): one translation unit, static.c includes the rest. -->
+    <ClCompile Include="third_party\mimalloc\src\static.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\mimalloc\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
     <ClCompile Include="src\Timer.cpp" />
     <ClCompile Include="src\Epochs.cpp" />
     <ClCompile Include="src\Fiber.cpp" />
     <ClCompile Include="src\GlobalFiberPool.cpp" />
+    <ClCompile Include="src\Hazard.cpp" />
+    <!-- Self-guarded: its body is #if !defined(_WIN32) && !defined(__linux__), so it compiles to
+         nothing here rather than colliding with src\win32\IoReactor.cpp. -->
+    <ClCompile Include="src\IoReactor_stub.cpp" />
+    <ClCompile Include="src\IoShared.cpp" />
+    <ClCompile Include="src\Reclaimer.cpp" />
+    <ClCompile Include="src\Stats.cpp" />
+    <ClCompile Include="src\TaskLocal.cpp" />
     <ClCompile Include="src\WaitGroup.cpp" />
     <ClCompile Include="src\TaskDAG.cpp" />
     <ClCompile Include="src\TaskScheduler.cpp" />
     <ClCompile Include="src\Thread.cpp" />
-    
+
     <ClCompile Include="src\win32\Topology.cpp" />
     <ClCompile Include="src\win32\FiberInit.cpp" />
     <ClCompile Include="src\win32\IoReactor.cpp" />

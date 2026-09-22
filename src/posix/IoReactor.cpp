@@ -7,9 +7,14 @@
 #include "../../include/TaskScheduler.h"
 #include "../IoPlatform.h"
 #include "IoUring.h"
+#include "../../include/platform.h"
+#include "../../include/Timer.h"
 
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -17,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <chrono>
 
 namespace JLib {
 
@@ -65,10 +71,13 @@ namespace ioplat {
 }
 
 namespace {
-    
+
     constexpr std::size_t kShards = 16;
 
-    constexpr std::uint64_t kWakeSentinel = 1;
+    // A NOP posted to end K's ring wait (Thread::Wake of the ring waiter).
+    constexpr std::uint64_t kWakeSentinel   = 1;
+    // The completion of an ASYNC_CANCEL request: nothing to do.
+    constexpr std::uint64_t kCancelSentinel = 2;
 
     const bool ioTrace = [] {
         const char* v = std::getenv("JLIB_IO_TRACE");
@@ -80,7 +89,12 @@ struct IoReactor::Impl {
     uring::Ring ring;
     bool        ringUp = false;
 
+    // The SQ has one producer at a time: any submitting thread, under this lock.
     std::mutex submitMx;
+
+    // The CQ has exactly one consumer, and it is the pump -- io_uring's CQ is single-consumer by
+    // design, and nothing else reaps. That is also why no claim is needed around it.
+    std::thread pump;
 
     struct Shard {
         mutable std::mutex m;
@@ -88,7 +102,6 @@ struct IoReactor::Impl {
         char pad[platform::kCacheLine];
     };
     Shard shards[kShards];
-    std::atomic<std::size_t> total{ 0 };
 
     Shard& ShardFor(const IoRequest* r) noexcept {
         const std::uintptr_t x = reinterpret_cast<std::uintptr_t>(r) >> 4;
@@ -102,7 +115,7 @@ struct IoReactor::Impl {
         r->next = s.head;
         if (s.head) s.head->prev = r;
         s.head = r;
-        total.fetch_add(1, std::memory_order_relaxed);
+        detail::g_ioOutstanding.fetch_add(1, std::memory_order_relaxed);
     }
 
     void UnlinkLocked(IoRequest* r) noexcept {
@@ -111,7 +124,7 @@ struct IoReactor::Impl {
         else if (s.head == r) s.head = r->next;
         if (r->next) r->next->prev = r->prev;
         r->prev = r->next = nullptr;
-        total.fetch_sub(1, std::memory_order_relaxed);
+        detail::g_ioOutstanding.fetch_sub(1, std::memory_order_relaxed);
     }
 
     void UnlinkUnlocked(IoRequest* r) noexcept {
@@ -120,179 +133,156 @@ struct IoReactor::Impl {
     }
 
     std::mutex               life;
-    std::atomic<bool>        stopping{ true };   
-    bool                     running = false;
-    std::vector<std::thread> workers;
+    std::atomic<bool>        stopping{ true };
 
-    void EnsureThreads() {
-        if (running) return;                       
-        std::lock_guard<std::mutex> lk(life);
-        if (running || !ringUp) return;
-        stopping.store(false, std::memory_order_release);
-        workers.emplace_back([this] { CompletionLoopEntry(this); });
-        running = true;
+    // The pump: a plain thread, not a pool worker, and the CQ's only reader. It sleeps in the ring
+    // wait, moves every completion into the injector (no wake -- every worker takes from it each
+    // pass), and goes straight back. It runs nothing itself. Workers never touch the CQ: reaping is
+    // a shared-memory read, but its tail is one cache line every worker would hit on every pass.
+    // Same design as the Windows pump; see tests/verify/kport_model.c.
+    static constexpr unsigned     kBatch     = 64;
+
+    // Stop() posts one of these to end the pump; nothing else does.
+    void PostWake() noexcept {
+        std::lock_guard<std::mutex> lk(submitMx);
+        uring::PostWake(ring, kWakeSentinel);
     }
 
-    static void CompletionLoopEntry(Impl* impl);
-};
+    // One CQE: publish the result and return the resume to run, or null if there is none, it was
+    // handed on (a pinned resume goes where its pin says), or the op was resubmitted.
+    Task* Complete(const io_uring_cqe& c);
 
-namespace {
-    IoReactor::Impl* g_impl = nullptr;   
-}
+    // A batch, ALL of it to the injector in one bulk push (no wake: every worker reads the
+    // injector each pass). Pinned resumes never get here -- Complete() routes them through
+    // WakeTask. Returns the number of stop markers seen.
+    unsigned Dispatch(const io_uring_cqe* cs, unsigned n) {
+        Task* ts[kBatch];
+        std::size_t nt = 0;
+        unsigned markers = 0;
+        for (unsigned i = 0; i < n; ++i) {
+            if (cs[i].user_data == kWakeSentinel)   { ++markers; continue; }
+            if (cs[i].user_data == kCancelSentinel) continue;
+            if (Task* t = Complete(cs[i])) ts[nt++] = t;
+        }
+        Inject(ts, nt);
+        return markers;
+    }
 
-void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
-    constexpr unsigned kCqBatch = 64;
-    constexpr std::size_t kBatch = 64;
-
-    io_uring_cqe cqes[kCqBatch];
-    Task* batchHi[kBatch];
-    Task* batchLo[kBatch];
-    std::size_t nHi = 0, nLo = 0;
-
-    auto flush = [&]() {
-        if (!TaskScheduler::IsInitialized()) { nHi = nLo = 0; return; }
+    static void Inject(Task** ts, std::size_t n) {
+        if (!n || !TaskScheduler::IsInitialized()) return;
+        if (TaskScheduler::PushInjector(ts, n)) {
+            detail::g_ioToLane.fetch_add(n, std::memory_order_relaxed);
+            return;
+        }
+        // Injector refused (pool stopping): each to a compute worker, as before the injector.
+        detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
         auto& s = TaskScheduler::Instance();
-        // Latency completions to the shared lane intake. Normal ones, and any the intake refuses,
-        // one per compute worker's hi-pri inbox, round-robin with a wake: that inbox is checked
-        // every pass ahead of the worker's own deque, so a busy worker takes it at its next task
-        // boundary (a normal inbox waits behind the worker's own successors; see win32).
-        auto toPool = [&](Task** arr, std::size_t n) {
-            for (std::size_t i = 0; i < n; ++i) s.PushTo(arr[i], CorePref::Any, true);
-        };
-        if (nHi) {
-            if (!(TaskScheduler::GetHotWorkers() != 0 && s.LaneIntakeEnabled()
-                  && TaskScheduler::PushLaneIntake(batchHi, nHi)))
-                toPool(batchHi, nHi);
-            nHi = 0;
-        }
-        if (nLo) { toPool(batchLo, nLo); nLo = 0; }
-    };
+        for (std::size_t i = 0; i < n; ++i) s.PushTo(ts[i], CorePref::Any, true);
+    }
 
-    for (;;) {
-        if (nHi == 0 && nLo == 0) {
-            
-            uring::WaitCq(impl->ring, 1);
-        }
-
-        const unsigned got = uring::Reap(impl->ring, cqes, kCqBatch);
-        if (got == 0) {
-            
-            if (nHi || nLo) { flush(); continue; }
-            if (impl->stopping.load(std::memory_order_acquire)) return;
-            continue;
-        }
-
-        for (unsigned i = 0; i < got; ++i) {
-            const io_uring_cqe& c = cqes[i];
-
-            if (c.user_data == kWakeSentinel) {
-                
-                flush();
-                if (impl->stopping.load(std::memory_order_acquire)) {
-                    std::lock_guard<std::mutex> lk(impl->submitMx);
-                    uring::PostWake(impl->ring, kWakeSentinel);
-                    return;
-                }
+    // The pump's whole life: sleep in the ring wait, inject, repeat -- until Stop() posts a marker.
+    // Above the compute workers, as the clock is (best effort: a negative nice needs privileges).
+    void Pump() {
+        (void)::syscall(SYS_setpriority, PRIO_PROCESS, (int)::syscall(SYS_gettid), -5);
+        for (;;) {
+            // Returns at once if the CQ already holds anything; otherwise sleeps until it does.
+            uring::WaitCq(ring, 1);
+            io_uring_cqe cs[kBatch];
+            const unsigned n = uring::Reap(ring, cs, kBatch);
+            if (n == 0) {
+                if (stopping.load(std::memory_order_acquire)) return;   // never spin on a dead ring
                 continue;
             }
+            if (Dispatch(cs, n) != 0 && stopping.load(std::memory_order_acquire)) return;
+        }
+    }
+};
 
-            IoRequest* r = reinterpret_cast<IoRequest*>(static_cast<std::uintptr_t>(c.user_data));
-            if (!r) continue;
+Task* IoReactor::Impl::Complete(const io_uring_cqe& c) {
+    IoRequest* r = reinterpret_cast<IoRequest*>(static_cast<std::uintptr_t>(c.user_data));
+    if (!r) return nullptr;
 
-            if (ioTrace) {
-                std::fprintf(stderr, "[io] CQE    req=%p res=%d kind=%d bufCount=%u\n",
-                             (void*)r, (int)c.res, (int)r->kind, (unsigned)r->bufCount);
-                std::fflush(stderr);
-            }
+    if (ioTrace) {
+        std::fprintf(stderr, "[io] CQE    req=%p res=%d kind=%d bufCount=%u\n",
+                     (void*)r, (int)c.res, (int)r->kind, (unsigned)r->bufCount);
+        std::fflush(stderr);
+    }
 
-            IoResult res{};
-            if (c.res >= 0) {
-                res.status = IoStatus::Completed;
-                res.error  = 0;
+    IoResult res{};
+    if (c.res >= 0) {
+        res.status = IoStatus::Completed;
+        res.error  = 0;
 
-                if (r->kind == IoRequest::Kind::Accept) {
-                    r->aux    = static_cast<std::uintptr_t>(c.res);
-                    res.bytes = 0;
-                } else {
-                    res.bytes = static_cast<std::uint32_t>(c.res);
+        if (r->kind == IoRequest::Kind::Accept) {
+            r->aux    = static_cast<std::uintptr_t>(c.res);
+            res.bytes = 0;
+        } else {
+            res.bytes = static_cast<std::uint32_t>(c.res);
 
-                    if (r->kind == IoRequest::Kind::Recv && r->aux) {
-                        auto* mh   = reinterpret_cast<struct msghdr*>(r->native);
-                        auto* addr = reinterpret_cast<IoAddress*>(r->aux);
-                        const std::size_t got = static_cast<std::size_t>(mh->msg_namelen);
-                        addr->len = static_cast<std::int32_t>(
-                            (got > IoAddress::kBytes) ? IoAddress::kBytes : got);
-                    }
-                }
-            } else if (c.res == -ECANCELED) {
-                
-                res.status = IoStatus::Cancelled;
-                res.bytes  = 0;
-                res.error  = ECANCELED;
-            } else {
-                res.status = IoStatus::Failed;
-                res.bytes  = 0;
-                res.error  = static_cast<std::uint32_t>(-c.res);
-            }
-
-            if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send
-                && r->bufCount > 0 && c.res > 0
-                && static_cast<std::size_t>(c.res) < ioplat::BufsRemaining(r)) {
-
-                r->xferred += static_cast<std::uint32_t>(c.res);
-                r->bufCount = ioplat::AdvanceBufs(r, static_cast<std::uint32_t>(c.res));
-
-                {
-                    std::lock_guard<std::mutex> lk(impl->ShardFor(r).m);
-                    impl->UnlinkLocked(r);
-                }
-
-                if (ioTrace) {
-                    std::fprintf(stderr,
-                        "[io] PARTIAL req=%p sent=%d total=%u remaining=%zu segs=%u -- resubmit\n",
-                        (void*)r, (int)c.res, (unsigned)r->xferred,
-                        ioplat::BufsRemaining(r), (unsigned)r->bufCount);
-                    std::fflush(stderr);
-                }
-
-                if (!IoReactor::Instance().SubmitPrepared(r)) continue;
-                res = r->out ? *r->out : res;
-            }
-
-            if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send)
-                res.bytes += r->xferred;
-
-            Task* resume = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(impl->ShardFor(r).m);
-                impl->UnlinkLocked(r);
-                if (r->out) *r->out = res;    
-                resume = r->resume;
-            }
-
-            if (r->onComplete) r->onComplete(r);
-
-#if defined(JLIBSCHED_COROUTINES)
-            // Coroutine I/O: resume is the suspended coroutine itself, not a fresh fiber job.
-            if (resume && TaskScheduler::IsInitialized() && TaskScheduler::IsPinned(resume)) {
-                TaskScheduler::Instance().WakeTask(resume);
-                resume = nullptr;
-            }
-#endif
-            if (resume) {
-                if (IsLowLatency(resume->lane)) batchHi[nHi++] = resume;
-                else                            batchLo[nLo++] = resume;
-                if (nHi == kBatch || nLo == kBatch) flush();
+            if (r->kind == IoRequest::Kind::Recv && r->aux) {
+                auto* mh   = reinterpret_cast<struct msghdr*>(r->native);
+                auto* addr = reinterpret_cast<IoAddress*>(r->aux);
+                const std::size_t got = static_cast<std::size_t>(mh->msg_namelen);
+                addr->len = static_cast<std::int32_t>(
+                    (got > IoAddress::kBytes) ? IoAddress::kBytes : got);
             }
         }
+    } else if (c.res == -ECANCELED) {
 
-        if ((nHi || nLo) && impl->stopping.load(std::memory_order_acquire)) flush();
+        res.status = IoStatus::Cancelled;
+        res.bytes  = 0;
+        res.error  = ECANCELED;
+    } else {
+        res.status = IoStatus::Failed;
+        res.bytes  = 0;
+        res.error  = static_cast<std::uint32_t>(-c.res);
     }
+
+    if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send
+        && r->bufCount > 0 && c.res > 0
+        && static_cast<std::size_t>(c.res) < ioplat::BufsRemaining(r)) {
+
+        r->xferred += static_cast<std::uint32_t>(c.res);
+        r->bufCount = ioplat::AdvanceBufs(r, static_cast<std::uint32_t>(c.res));
+
+        {
+            std::lock_guard<std::mutex> lk(ShardFor(r).m);
+            UnlinkLocked(r);
+        }
+
+        if (ioTrace) {
+            std::fprintf(stderr,
+                "[io] PARTIAL req=%p sent=%d total=%u remaining=%zu segs=%u -- resubmit\n",
+                (void*)r, (int)c.res, (unsigned)r->xferred,
+                ioplat::BufsRemaining(r), (unsigned)r->bufCount);
+            std::fflush(stderr);
+        }
+
+        if (!IoReactor::Instance().SubmitPrepared(r)) return nullptr;
+        res = r->out ? *r->out : res;
+    }
+
+    if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send)
+        res.bytes += r->xferred;
+
+    Task* resume = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ShardFor(r).m);
+        UnlinkLocked(r);
+        if (r->out) *r->out = res;
+        resume = r->resume;
+    }
+
+    if (r->onComplete) r->onComplete(r);   // may resubmit or free r: not touched after
+
+    if (resume && TaskScheduler::IsInitialized() && TaskScheduler::IsPinned(resume)) {
+        TaskScheduler::Instance().WakeTask(resume);
+        return nullptr;
+    }
+    return resume;
 }
 
 IoReactor::IoReactor() : impl(new Impl()) {
-    g_impl = impl;
-    
     if (uring::Init(impl->ring, 256) == uring::InitResult::Ok) impl->ringUp = true;
 }
 
@@ -300,13 +290,12 @@ IoReactor::~IoReactor() {
     Stop();
     if (impl->ringUp) uring::Shutdown(impl->ring);
     delete impl;
-    g_impl = nullptr;
 }
 
 IoReactor& IoReactor::Instance() { static IoReactor* r = new IoReactor(); return *r; }
 
 bool IoReactor::IsAvailable() noexcept {
-    
+
     {
         static const bool off = [] {
             const char* v = std::getenv("JLIB_IO_URING_OFF");
@@ -326,36 +315,63 @@ bool IoReactor::IsAvailable() noexcept {
     return probed;
 }
 
-void IoReactor::Start() noexcept {
-    if (!impl->ringUp) return;
-
-    impl->EnsureThreads();
+namespace {
+    void StartIoHook() { IoReactor::Instance().Start(); }
+    void StopIoHook()  { IoReactor::Instance().Stop(); }
 }
 
+// THE OPT-IN. Nothing I/O exists until this runs: it starts the pump and registers the stop hook
+// Join calls. Before or after Init: before, it only leaves a start hook and Init starts the pump
+// once the pool can take completions (see detail::g_ioStartHook). A no-op where io_uring is
+// unavailable (IsAvailable() says so up front).
+void IoReactor::Start() noexcept {
+    if (!TaskScheduler::IsInitialized()) {
+        detail::g_ioStartHook.store(&StartIoHook, std::memory_order_release);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(impl->life);
+    if (!impl->ringUp) return;
+    impl->stopping.store(false, std::memory_order_release);
+    if (!impl->pump.joinable()) impl->pump = std::thread([p = impl] { p->Pump(); });
+    detail::g_ioStopHook.store(&StopIoHook, std::memory_order_release);
+}
+
+// Called from Join (through the hook) while the pool still runs. Cancels everything in flight and
+// lets the pump drain the CQ -- it stays the only reader to the end -- so every resume is handed
+// to the pool before it stops. A request that ignores its cancel would hold this forever, so the
+// wait gives up after a bounded spell with no progress. Then the stop marker ends the pump.
 void IoReactor::Stop() noexcept {
-    bool needJoin = false;
     {
         std::lock_guard<std::mutex> lk(impl->life);
         if (impl->stopping.load(std::memory_order_acquire)) return;
         impl->stopping.store(true, std::memory_order_release);
-        needJoin = impl->running;
     }
+    detail::g_ioStopHook.store(nullptr, std::memory_order_release);
 
     RequestCancel(CancelToken{});
 
-    if (needJoin) {
-        std::vector<std::thread> ts;
-        { std::lock_guard<std::mutex> lk(impl->life); ts.swap(impl->workers); impl->running = false; }
-        for (std::size_t i = 0; i < ts.size(); ++i) {
-            std::lock_guard<std::mutex> lk(impl->submitMx);
-            uring::PostWake(impl->ring, kWakeSentinel);
-        }
-        for (auto& t : ts) if (t.joinable()) t.join();
+    int quietMs = 0;
+    std::size_t last = detail::g_ioOutstanding.load(std::memory_order_acquire);
+    while (last != 0 && quietMs < 2000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const std::size_t now = detail::g_ioOutstanding.load(std::memory_order_acquire);
+        quietMs = (now == last) ? quietMs + 10 : 0;   // quiet = no completion in the step
+        last = now;
+    }
+
+    // `stopping` is already set, so the pump returns on this marker (nothing else posts one).
+    if (impl->pump.joinable()) {
+        impl->PostWake();
+        impl->pump.join();
+    }
+    if (const std::size_t left = detail::g_ioOutstanding.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "[JLib::Scheduler] I/O stop: %zu request(s) still outstanding after "
+                             "cancel; their resumes will not run.\n", left);
     }
 }
 
 std::size_t IoReactor::InFlight() const noexcept {
-    return impl->total.load(std::memory_order_relaxed);
+    return detail::g_ioOutstanding.load(std::memory_order_relaxed);
 }
 
 bool IoReactor::Register(void*)            { return true; }
@@ -384,9 +400,6 @@ static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
     req->out    = out;
     req->resume = resume;
     req->token  = tok;
-
-    if (resume && resume->type == TaskType::Fiber && resume->stackClass == StackClass::Standard)
-        resume->stackClass = StackClass::Tiny;
 
     impl->Link(req);
 
@@ -424,7 +437,6 @@ static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
         }
     }
 
-    impl->EnsureThreads();
     return false;      
 }
 
@@ -698,7 +710,7 @@ std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
             
             sqe->addr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(targets[k]));
             
-            sqe->user_data = kWakeSentinel;
+            sqe->user_data = kCancelSentinel;
             if (uring::Submit(impl->ring, 0) < 0) break;
             ++asked;
         }

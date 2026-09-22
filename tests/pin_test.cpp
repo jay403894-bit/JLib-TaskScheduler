@@ -1,4 +1,4 @@
-// Per-call pinning. Arg "f" = SetDefaultPin(Pin::Current) (forced). Build with
+﻿// Per-call pinning. Arg "f" = SetDefaultPin(Pin::Current) (forced). Build with
 // -DJLIBSCHED_COROUTINES=1 against the coroutine library to include the coroutine checks.
 #include <TaskScheduler.h>
 #include <Thread.h>
@@ -43,7 +43,7 @@ static void Stayed(int at) { if (at >= 0 && Q() != at) g_moved++; }
 static void CurrentBody(void*) {
 	for (int i = 0; i < 20; ++i) {
 		int at = Q(); WaitTiny(Pin::Current);        Stayed(at);
-		at = Q();     Thread::CoYield(Pin::Current); Stayed(at);
+		at = Q();     Thread::Yield(Pin::Current); Stayed(at);
 		at = Q();     g_mtx.Lock(Pin::Current);      Stayed(at);
 		std::this_thread::yield();               // hold briefly so others contend
 		g_mtx.Unlock();
@@ -95,7 +95,7 @@ static Coro CoroThread(int target) {
 static void RunMany(void (*fn)(void*), int n) {
 	auto& s = TaskScheduler::Instance();
 	WaitGroup wg; wg.n.store(n);
-	for (int i = 0; i < n; ++i) { Task* t = s.CreateTask(fn, nullptr); t->waitGroup = &wg; s.Push(t); }
+	for (int i = 0; i < n; ++i) { Task* t = s.CreateTask(fn, nullptr, Lane::Normal, TaskType::Fiber); t->waitGroup = &wg; s.Push(t); }
 	s.WaitFor(wg);
 }
 static void Reset() { g_moved = 0; g_runs = 0; g_wrong = 0; g_notK = 0; }

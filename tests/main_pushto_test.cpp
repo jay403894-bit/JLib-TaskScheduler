@@ -1,4 +1,4 @@
-// FTL: can PushTo(0) + Pin::Thread(0) replace mainQ for main-only work?
+﻿// FTL: can PushTo(0) + Pin::Thread(0) replace mainQ for main-only work?
 // Plain fiber tasks are pushed with PushTo(0) (main's hi-pri inbox, run directly by main) and
 // suspend with Pin::Thread(0). Every step must run on the OS main thread.
 #include <TaskScheduler.h>
@@ -23,7 +23,7 @@ static void MainOnly(void*) {
 		t->waitGroup = &wg; s.Push(t);
 		s.WaitFor(wg, Pin::Thread(0));           // resume on main
 		if (std::this_thread::get_id() != g_mainId) g_offMain++;
-		Thread::CoYield(Pin::Thread(0));
+		Thread::Yield(Pin::Thread(0));
 	}
 	g_done++;
 }
@@ -37,7 +37,7 @@ int main() {
 	constexpr int kTasks = 64;
 	WaitGroup all; all.n.store(kTasks);
 	for (int i = 0; i < kTasks; ++i) {
-		Task* t = s.CreateTask(&MainOnly, nullptr);
+		Task* t = s.CreateTask(&MainOnly, nullptr, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &all;
 		if (!s.PushTo(0, t)) { std::printf("PushTo(0) refused\n"); return 1; }
 	}

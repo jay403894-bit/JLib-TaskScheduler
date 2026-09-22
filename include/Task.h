@@ -11,22 +11,31 @@ namespace JLib {
     struct Fiber;
     struct Task;
     struct DirectEvent;
+    class Thread;
     
     struct WaitGroup;
 
-    // Fiber: runs on a fiber and may block. A native task (the `native` bit: every lambda task, and
-    // fn+ctx tasks from CreateNativeTask) is called directly on the worker's stack instead and must
-    // not suspend (fatal at every suspend point); it may block the OS thread only inside
-    // TaskScheduler::BlockInPlace. For a lambda that is a lifetime proof: its closure lives in the
-    // task's slab slot, which is freed as soon as the call returns.
+    // What a worker is holding when it picks a task up. This is METADATA THE LOOP READS: the type
+    // decides how the task is run, and the deque packs it into the low bits of the Task* so a thief
+    // can vet a task without touching it (TaskDeque::tag/bits). Every value must therefore fit in
+    // two bits.
+    //
+    // Fiber: runs on a fiber and may block.
     // Coroutine: resumed by a direct call on the worker's stack; waits by co_await
     // (JLIBSCHED_COROUTINES, Coroutine.h).
-    // Main: must run on the OS main thread. Set by PushMain; every resume/yield/requeue sends it
-    // back through PushMainQueue -- slot 0's hi-pri inbox with main in the pool (on a fiber), mainQ
-    // with main out of it (run directly).
-    enum class TaskType : uint8_t { Fiber, Coroutine, Main };
+    // Native: called directly on the worker's stack, no fiber checked out, and must not suspend
+    // (fatal at every suspend point); it may block the OS thread only inside
+    // TaskScheduler::BlockInPlace. Every lambda task is Native, and fn+ctx tasks are Native by
+    // default. For a lambda that is a lifetime proof: its closure lives in the task's slab slot,
+    // which is freed as soon as the call returns.
+    //
+    // WHERE a task runs is not a type. PushMain / PushTo choose where it starts; the Pin each
+    // suspension passes chooses where it resumes (Pin::Main for main).
+    enum class TaskType : uint8_t { Fiber, Coroutine, Native };
 
-    enum class StackClass : uint8_t { Standard = 0, Tiny = 1, Deep = 2 };
+    // A fiber's stack size. The values index per-class arrays (GlobalFiberPool, Thread's caches),
+    // so they must stay dense from 0.
+    enum class StackClass : uint8_t { Standard = 0, Deep = 1 };
 
     enum class Lane : uint8_t { Normal = 0, LowLatency = 1 };
 
@@ -87,24 +96,39 @@ namespace JLib {
         TaskType  type          : 2;     \
         uint8_t   priorityBoost : 1;     \
         uint8_t   trivialDtor   : 1;     \
-        StackClass stackClass   : 2;     \
-        uint8_t   native    : 1;
+        StackClass stackClass   : 2;
 
     // A task's durable identity: born with the task (CreateTask), dies with it (FreeTask).
     // Holds scheduling state that follows the task; the body (a fiber today) is attached when the
     // task first runs. Allocated from the 64-byte slab class and must stay within one cache line.
-    struct FiberDebt;
+    // One "release this when my task dies" registration, supplied by the caller (its storage is
+    // theirs -- see TaskScheduler::ReleaseOnTaskDeath, which links it onto TaskRecord::debts).
+    // Lives here rather than in Fiber.h because the record owns the list and a coroutine task has
+    // no fiber.
+    struct TaskDebt {
+        TaskDebt* next = nullptr;
+        void*      obj  = nullptr;
+        void     (*release)(void*) noexcept = nullptr;
+    };
+
     struct Task;
     struct TaskRecord {
         static constexpr size_t   kLocalSlots = 8;
         static constexpr uint16_t kNoPin      = Pin::kNone;
 
         Fiber*      fiber       = nullptr;   // body; null until first run
-        FiberDebt*  debts       = nullptr;   // cleanup owed at death; each names its holder
+        TaskDebt*  debts       = nullptr;   // released at task death, oldest last
         void**      locals      = nullptr;   // task-local slots, allocated on first use
-        Task*       waitNext    = nullptr;   // link while the task is suspended on a WaitGroup
+        Task*       waitNext    = nullptr;   // link while suspended on a WaitGroup or an Event
+        Task*       waitPrev    = nullptr;   // back link, Event only (its list is doubly linked)
         uint32_t    generation  = 0;         // bumped on reuse; lets stale references detect it
         uint16_t    pinTo       = kNoPin;    // worker a suspended task must resume on (see Pin)
+        // The Thread running this task NOW: written by the scheduler before every hand-over -- a
+        // pickup, a steal, a resume, a fiber switch -- where thread identity is reliable. Task code
+        // asks its record instead of touching thread-local storage: after a migration a compiler may
+        // reuse a TLS ADDRESS computed before the switch (MSVC /GT, LLVM llvm.threadlocal.address),
+        // which is the OLD thread's slot. Re-read it after every suspension; never keep it across one.
+        Thread*     home        = nullptr;
 #if defined(JLIBSCHED_STATS)
         uint64_t    statFirstRun  = 0;       // clock ticks at first run
         uint64_t    statSuspendAt = 0;       // clock ticks at the last suspension, 0 while running
@@ -128,16 +152,21 @@ namespace JLib {
 
         uint32_t cancelToken = 0xFFFFFFFFu;   
 
+        // Runs on the worker's own stack with no fiber, and must not suspend. Derived from the type
+        // rather than stored: the deque's steal tag already encodes Native as its own code, so a
+        // separate bit would be a second copy of the same fact with nothing keeping the two equal.
+        bool native() const noexcept { return type == TaskType::Native; }
+
         Task()
             : fn(nullptr), data(nullptr), record(nullptr), next(nullptr),
               lane(Lane::Normal), type(TaskType::Fiber),
               priorityBoost(0), trivialDtor(0),
-              stackClass(StackClass::Standard), native(0) { ; }
+              stackClass(StackClass::Standard) { ; }
         Task(Func f, void* d = nullptr, Lane ln = Lane::Normal)
             : fn(f), data(d), record(nullptr), next(nullptr),
               lane(ln), type(TaskType::Fiber),
               priorityBoost(0), trivialDtor(0),
-              stackClass(StackClass::Standard), native(0) {
+              stackClass(StackClass::Standard) {
         }
         virtual ~Task() {
 
@@ -182,11 +211,10 @@ namespace JLib {
 
             probe([](TaskFlagPacking& f) { f.lane          = Lane::LowLatency; });
             
-            probe([](TaskFlagPacking& f) { f.type          = TaskType::Main; });   // non-zero value
+            probe([](TaskFlagPacking& f) { f.type          = TaskType::Native; });   // non-zero value
             probe([](TaskFlagPacking& f) { f.priorityBoost = 1; });
             probe([](TaskFlagPacking& f) { f.trivialDtor   = 1; });
-            probe([](TaskFlagPacking& f) { f.stackClass    = StackClass::Deep; });
-            return h;
+            probe([](TaskFlagPacking& f) { f.stackClass    = StackClass::Deep; });            return h;
         }
     }
 
@@ -202,8 +230,8 @@ namespace JLib {
             func(std::move(f))
         {
             this->data = this;
-            
-            this->native = 1;
+
+            this->type = TaskType::Native;
         }
 
         LambdaTask(const F& f)
@@ -211,7 +239,7 @@ namespace JLib {
             func(f)
         {
             this->data = this;
-            this->native = 1;
+            this->type = TaskType::Native;
         }
 		~LambdaTask() {
 		}

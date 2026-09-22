@@ -16,23 +16,18 @@ namespace JLib {
     class Thread;
     class GlobalFiberPool {
         
-        static constexpr size_t kTinyUsablePages = 2;
-        static constexpr size_t kStandardUsable  = 60  * 1024;   
-        static constexpr size_t kDeepUsable      = 508 * 1024;   
+        static constexpr size_t kStandardUsable  = 60  * 1024;
+        static constexpr size_t kDeepUsable      = 508 * 1024;
 
         static size_t UsableFor(StackClass c) {
-            switch (c) {
-                case StackClass::Tiny: return kTinyUsablePages * JLib::platform::PageSize();
-                case StackClass::Deep: return kDeepUsable;
-                default:               return kStandardUsable;
-            }
+            return c == StackClass::Deep ? kDeepUsable : kStandardUsable;
         }
-        
+
         static size_t RegionFor(StackClass c) {
             return UsableFor(c) + JLib::platform::PageSize();
         }
 
-        static constexpr size_t kClassCount = 3;
+        static constexpr size_t kClassCount = 2;   // StackClass::Standard, StackClass::Deep
 
         // Fibers come in blocks: one Fiber array and one stack arena each. A block is never moved
         // or freed while the pool lives, so a Fiber* stays valid; the pool grows by one block when
@@ -56,7 +51,7 @@ namespace JLib {
         bool   notedGrowth[kClassCount] = {};
         std::vector<Block> blocks[kClassCount];
 
-        GlobalFiberPool(size_t tinyCount, size_t standardCount, size_t deepCount, size_t memoryLimit);
+        GlobalFiberPool(size_t standardCount, size_t deepCount, size_t memoryLimit);
 
         bool AddBlock(StackClass c, size_t count);   // caller holds poolMutex
         bool Grow(StackClass c);
@@ -66,8 +61,8 @@ namespace JLib {
 
         // memoryLimit: total stack bytes all classes may reach by growing (0 = no limit). The
         // initial counts are always made, even past it.
-        static GlobalFiberPool* Create(size_t standardCount, size_t tinyCount = 0,
-                                       size_t deepCount = 0, size_t memoryLimit = 0);
+        static GlobalFiberPool* Create(size_t standardCount, size_t deepCount = 0,
+                                       size_t memoryLimit = 0);
 
         size_t CountOf(StackClass c) const { return classCount[(size_t)c].load(std::memory_order_relaxed); }
         size_t CommittedBytes() const { return committedBytes.load(std::memory_order_relaxed); }

@@ -3,27 +3,23 @@
 
 #pragma once
 #include "Context.h"
-#include "TsanFiber.h"   
 #include "platform.h"
 #include "Task.h"
 #include "Epochs.h"
 #include "Stats.h"
 #include <atomic>
 #include <cstdint>
+extern "C" void FiberTrampoline();
 namespace JLib {
-	// Native tasks and coroutines run on the worker's stack with no fiber, so neither can suspend.
-	// Called at every blocking wait:
-	//   native    -> abort with a message.
-	//   coroutine -> debug: assert naming the task (it must co_await instead).
-	//                release: nothing; the wait blocks the worker for its duration.
 	[[noreturn]] void NativeSuspendViolation(const char* where) noexcept;
 	void CoroutineBlockingWait(const Task* t, const char* where) noexcept;
 	inline void CheckSuspendable(const Task* t, const char* where) noexcept {
 		if (!t) return;
-		if (t->native) NativeSuspendViolation(where);
+		if (t->type == TaskType::Native) NativeSuspendViolation(where);
 		if (t->type == TaskType::Coroutine) CoroutineBlockingWait(t, where);
 	}
 	void CheckSuspendableCurrent(const char* where) noexcept;   // uses the current thread's task
+
 }
 namespace JLib {
 	enum class FiberStatus {
@@ -37,29 +33,18 @@ namespace JLib {
 		TRANSFERRED,
 		DEAD           
 	};
-	
-	struct FiberDebt {
-		FiberDebt* next = nullptr;
-		void*      obj  = nullptr;
-		void     (*release)(void*) noexcept = nullptr;
 
-		static constexpr size_t kAnyHolder = (size_t)-1;
-		size_t holder = kAnyHolder;
-	};
-
-	struct Fiber;   
+	struct Fiber;
 	namespace detail {
-		
+
 		void ReleaseFiberSlots(void** slots, size_t n) noexcept;
 
 		void SetCurrentFiber(Fiber* f) noexcept;
-
-#if defined(JLIB_TSAN)
-		void TsanSwitchToScheduler() noexcept;
-#endif
-
-		void HandOffFiberDebts(FiberDebt* head) noexcept;
 	}
+
+	// Defined in Fiber.cpp, so this header does not need TaskScheduler: Fiber::Resume can place a
+	// task it claimed. (The suspend primitives stamp their pin with StampPin, from Task.h.)
+	void RequeueResume(Task* task);
 
 	struct alignas(16) Fiber {
 		Context ctx;
@@ -76,18 +61,7 @@ namespace JLib {
 		Context* homeCtx = nullptr;
 
 		// Pin, debts and task-local slots live on the task's TaskRecord, not here.
-		static constexpr size_t kLocalSlots = TaskRecord::kLocalSlots;
-
-
-		void* tsanFiber = nullptr;
-
-		// Kinds of cleanup a task can owe its holders (stored on TaskRecord::owedKinds).
-		enum OwedKind : uint32_t {
-			kOwesNothing = 0,
-			kOwesSlab    = 1u << 0,
-			kOwesEpoch   = 1u << 1,
-			kOwesHazard  = 1u << 2,
-		};
+		static constexpr size_t kLocalSlots = TaskRecord::kLocalSlots;	
 
 		void ResetForReuse() {
 			owningTask = nullptr;
@@ -114,47 +88,147 @@ namespace JLib {
 		Fiber& operator=(Fiber&&) = delete;
 		Fiber(const Fiber&) = delete;
 		Fiber& operator=(const Fiber&) = delete;
-		void Init(void (*entryPoint)());
-		
+#if JLIB_PLATFORM_WINDOWS
+		// The TEB stack bounds the context switch installs on entry (see ContextSwitch.asm 1b). The
+		// region is [stackBase, stackBase+stackSize): one uncommitted guard page, then the stack.
+		uintptr_t TebStackBase()  const { return (uintptr_t)stackBase + stackSize; }
+		uintptr_t TebStackLimit() const { return (uintptr_t)stackBase + platform::PageSize(); }
+		uintptr_t TebDealloc()    const { return (uintptr_t)stackBase; }
+#endif
+#if JLIB_PLATFORM_WINDOWS && JLIB_ARCH_X86_64
+		inline void Init(void(*entryPoint)()) {
+
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+
+			sp -= 4;
+
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+
+			*(--sp) = (uintptr_t)entryPoint;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+
+			*(--sp) = TebStackBase();
+			*(--sp) = TebStackLimit();
+			*(--sp) = TebDealloc();
+			*(--sp) = 0;
+
+			*(--sp) = 0x0000037F00001F80ULL;
+
+			for (int k = 0; k < 20; ++k) *(--sp) = 0;
+
+			ctx.rsp = (void*)sp;
+		}
+#elif JLIB_ARCH_X86_64      
+		inline void Init(void(*entryPoint)()) {
+
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+
+			*(--sp) = 0;
+			*(--sp) = (uintptr_t)entryPoint;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+
+			*(--sp) = 0x0000037F00001F80ULL;
+
+			ctx.rsp = (void*)sp;
+		}
+#elif JLIB_ARCH_AARCH64
+		inline void Init(void(*entryPoint)()) {
+
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+			*(--sp) = 0;
+
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = 0;
+			*(--sp) = (uintptr_t)entryPoint;
+
+#if JLIB_PLATFORM_WINDOWS
+			// Windows ARM64: the TEB block (src/win32/aarch64/ContextSwitch.asm step 1b).
+			*(--sp) = TebStackBase();
+			*(--sp) = TebStackLimit();
+			*(--sp) = 0;
+			*(--sp) = TebDealloc();
+#endif
+
+			*(--sp) = 0;
+
+			*(--sp) = 0;
+
+			for (int i = 0; i < 8; ++i)
+				*(--sp) = 0;
+
+			ctx.rsp = (void*)sp;
+		}
+#endif
+	
 		// The suspend primitives. Every suspending API calls one of these before it registers the
 		// waiter (a waker may resume the task at once), passing its Pin through untouched.
-		inline void BeginSuspend(Pin pin) noexcept {
-			StampPin(owningTask, pin);
-			status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
-		}
-		inline void BeginYield(Pin pin) noexcept {
-			JLIB_STAT(Yields);
+#undef Yield
+		inline void BeginYield(Pin pin = Pin::None) {
 			StampPin(owningTask, pin);
 			status.store(FiberStatus::WANTS_YIELD, std::memory_order_release);
-		}
 
-		inline void CoYield(Pin pin = Pin::None) {
-			CheckSuspendable(this->owningTask, "Fiber::CoYield");
-			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::CoYield");
+		}
+		inline void Yield(Pin pin = Pin::None) {
+			// Native and Coroutine bodies cannot suspend; only a fiber can.
+			if (this->owningTask->type == TaskType::Native
+			 || this->owningTask->type == TaskType::Coroutine)
+				return;
+			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::Yield");
 			BeginYield(pin);
-#if defined(JLIB_TSAN)
-			detail::TsanSwitchToScheduler();
-#endif
 			ContextSwitch(&this->ctx, this->homeCtx);
 		}
+		inline void BeginSuspend(Pin pin = Pin::None) {
+			// Native and Coroutine bodies cannot suspend; only a fiber can.
+			if (this->owningTask->type == TaskType::Native
+			 || this->owningTask->type == TaskType::Coroutine)
+				return;
+			StampPin(owningTask, pin);
+			status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 
+		}
 		inline void Suspend(Pin pin = Pin::None) {
-			CheckSuspendable(this->owningTask, "Fiber::Suspend");
+			// Native and Coroutine bodies cannot suspend; only a fiber can.
+			if (this->owningTask->type == TaskType::Native
+			 || this->owningTask->type == TaskType::Coroutine)
+				return;
 			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::Suspend");
 			BeginSuspend(pin);
-#if defined(JLIB_TSAN)
-			detail::TsanSwitchToScheduler();
-#endif
 			ContextSwitch(&this->ctx, this->homeCtx);
 		}
 		
-		inline bool ResumeQueueless() {
+		inline bool Resume() {
 			while (true) {
 				FiberStatus s = status.load(std::memory_order_acquire);
 				if (s == FiberStatus::SUSPENDED) {
 					FiberStatus exp = FiberStatus::SUSPENDED;
-					return status.compare_exchange_strong(exp, FiberStatus::READY,
-						std::memory_order_acq_rel);
+					if (status.compare_exchange_strong(exp, FiberStatus::READY, std::memory_order_acq_rel)) {
+						RequeueResume(owningTask);
+						return true;
+					}
+					return false;
 				}
 				else if (s == FiberStatus::WANTS_SUSPEND) {
 					FiberStatus exp = FiberStatus::WANTS_SUSPEND;
@@ -177,9 +251,11 @@ namespace JLib {
 		// this fiber, clearing an innocent thread's pin.
 		inline bool SwitchTo(Fiber* f) {
 			if (!f || f == this) return false;
-			CheckSuspendable(this->owningTask, "Fiber::SwitchTo");
 			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::SwitchTo");
-
+			// Native and Coroutine bodies cannot suspend; only a fiber can.
+			if (this->owningTask->type == TaskType::Native
+			 || this->owningTask->type == TaskType::Coroutine)
+				return false;
 			FiberStatus exp = FiberStatus::READY;
 			if (!f->status.compare_exchange_strong(exp, FiberStatus::RUNNING,
 					std::memory_order_acq_rel, std::memory_order_relaxed)) {
@@ -198,15 +274,17 @@ namespace JLib {
 
 			detail::SetCurrentFiber(f);
 
+			// A direct hand-over (no scheduler pass): the thread running this fiber runs f next.
+			if (f->owningTask && f->owningTask->record && this->owningTask->record)
+				f->owningTask->record->home = this->owningTask->record->home;
+
 			ContextSwitch(&this->ctx, &f->ctx);
 
 			return true;
 		}
 
 		inline Fiber* LastYielder() const { return last_yielder; }
-
-		void Resume();   
-
+	
 		bool IsReady() const { return status == FiberStatus::READY; }
 	};
 } 
@@ -214,4 +292,5 @@ namespace JLib {
 namespace JLib {
 	
 	void RequeueResumedBatch(Task** tasks, size_t n, Lane lane);
+	void RequeueResume(Task* task);
 }

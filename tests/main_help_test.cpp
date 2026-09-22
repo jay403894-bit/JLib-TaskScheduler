@@ -1,4 +1,4 @@
-// MainMode::OutOfPool: main does NOT steal while it waits -- it runs only what is routed TO it.
+﻿// MainMode::OutOfPool: main does NOT steal while it waits -- it runs only what is routed TO it.
 //
 // Main out of the pool has no slot, so a stealing main is a stand-in thread by another name: the
 // same shape as a spare, with the same problems. Nothing can pin to it, and worse, it could steal
@@ -76,7 +76,7 @@ int main() {
 	}).detach();
 	WaitGroup wg; wg.n.store(kN + 2000);
 	for (int i = 0; i < kN; ++i) {
-		Task* t = s.CreateTask(&Work, (void*)(intptr_t)i);
+		Task* t = s.CreateTask(&Work, (void*)(intptr_t)i, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &wg; s.Push(t);
 	}
 	for (int i = 0; i < 2000; ++i) {
@@ -92,7 +92,7 @@ int main() {
 	std::printf("[PushMain while main is parked in WaitFor]\n");
 	{
 		WaitGroup w2; w2.n.store(1);
-		Task* p = s.CreateTask(&PostMain, nullptr);
+		Task* p = s.CreateTask(&PostMain, nullptr, Lane::Normal, TaskType::Fiber);
 		p->waitGroup = &w2; s.Push(p);
 		s.WaitFor(w2);
 		// The main-only task may still be queued: main runs it in its next wait.

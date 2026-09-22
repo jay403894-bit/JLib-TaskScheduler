@@ -33,28 +33,4 @@ const AvxGateInit g_avxGateInit;
 
 } 
 
-void Fiber::Init(void(*entryPoint)())
-{
-	
-	uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
-	uintptr_t* sp = (uintptr_t*)top;
 
-	sp -= 4;                                 
-
-	*(--sp) = (uintptr_t)&FiberTrampoline;
-
-	*(--sp) = (uintptr_t)entryPoint; 
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-
-	*(--sp) = 0x0000037F00001F80ULL;
-
-	for (int k = 0; k < 20; ++k) *(--sp) = 0; 
-
-	ctx.rsp = (void*)sp; 
-}

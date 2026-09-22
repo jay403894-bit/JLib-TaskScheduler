@@ -41,7 +41,7 @@ static bool Until(P pred, S step, int ms) {
 static void Spawn(void (*fn)(void*), void* arg, int n, WaitGroup& wg) {
 	auto& s = TaskScheduler::Instance();
 	wg.n.fetch_add(n);
-	for (int i = 0; i < n; ++i) { Task* t = s.CreateTask(fn, arg); t->waitGroup = &wg; s.Push(t); }
+	for (int i = 0; i < n; ++i) { Task* t = s.CreateTask(fn, arg, Lane::Normal, TaskType::Fiber); t->waitGroup = &wg; s.Push(t); }
 }
 
 static WaitGroup* g_gate = nullptr;
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
 	cfg.mode    = Mode::Migrate;
 	cfg.main    = MainMode::OutOfPool;
 	cfg.workers = 4;
-	cfg.fibers  = { 2, 2, 1 };
+	cfg.fibers  = { 2, 1 };   // normal, deep: small, so the pool has to grow
 	if (limit) cfg.fiberMemoryLimit = 64u << 20;
 	TaskScheduler::Init(cfg);
 	std::thread([] {

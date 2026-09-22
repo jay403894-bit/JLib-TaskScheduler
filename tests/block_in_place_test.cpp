@@ -1,4 +1,4 @@
-// BlockInPlace on a worker: the slot is busy until the call returns and nobody stands in for it.
+﻿// BlockInPlace on a worker: the slot is busy until the call returns and nobody stands in for it.
 // What BlockBegin does is stop the stall from hiding work -- it unloads the normal inbox onto the
 // deque (stealable) and marks the thread away so unplaced pushes pick someone else.
 //
@@ -174,9 +174,9 @@ int main(int argc, char** argv) {
 		s.Push(s.CreateTask([](void* p) {
 			if (TaskScheduler::Instance().IsOnFiber()) fiberSeen.fetch_add(1);
 			static_cast<WaitGroup*>(p)->Done();
-		}, &wg2));
+		}, &wg2, Lane::Normal, TaskType::Fiber));
 		s.WaitFor(wg2);
-		Check(fiberSeen.load() == 1, "control: a CreateTask(fn, ctx) task does run on a fiber");
+		Check(fiberSeen.load() == 1, "control: an explicit TaskType::Fiber fn+ctx task does run on a fiber");
 	}
 
 	// 6.

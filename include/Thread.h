@@ -17,6 +17,12 @@
 #include "TsanFiber.h"   
 #include "GlobalFiberPool.h"
 #include "WaitGroup.h"
+#include "Memory.h"
+#include <cassert>
+#include <cstddef>
+#include <new>
+struct mi_heap_s;    // mimalloc heap (Memory.h); only pointers live here
+struct mi_theap_s;   // its thread-local part
 namespace JLib {
 	class TaskScheduler;
 
@@ -54,6 +60,29 @@ namespace JLib {
         }
         Fiber* currentFiber = nullptr;
         Task* currentRunningTask = nullptr;
+        // This worker's own heap (Memory.cpp), created on its first allocation, and that heap's
+        // thread-local part for the no-lookup path. Only ever read through GetCurrent() -- see
+        // Memory.h for why neither may be cached across a suspension.
+        mi_heap_s*  heap  = nullptr;
+        mi_theap_s* theap = nullptr;
+        // Allocate from THIS thread's heap (Memory.cpp). Task code reaches it as
+        // task->record->home->Alloc(n) -- the record, not TLS, says which thread it is on now.
+        // Only valid on this thread: home is written at every hand-over, so it always is (debug
+        // builds assert it). Free with JLib::Free, from any thread.
+        void* Alloc(std::size_t bytes) noexcept;
+        void* AllocAligned(std::size_t bytes, std::size_t alignment) noexcept;
+
+        // WORKER-LOCAL STORAGE: one T per Thread, keyed by type -- no slot table to register with;
+        // the per-worker copies ARE the workers[] array (TaskScheduler::GetWorkers). Built the first
+        // time THIS thread asks, in its own heap, so per-worker buckets need no locks: each worker
+        // only ever writes its own.
+        //   task->record->home->Local<Bucket>()   from task code (home is the running thread)
+        //   for (Thread* w : TaskScheduler::GetWorkers()) w->PeekLocal<Bucket>()   collect, AFTER the join
+        // Destroyed at Join, before the heap. T must be default-constructible.
+        template <class T> T& Local();
+        template <class T> T* PeekLocal() const noexcept;
+        static constexpr std::size_t kMaxLocalTypes = 32;
+
         int qIndex = 0;
         // Epoch slot, handed out by StartPool: 0 is always main; workers are 1..N (OutOfPool) or 1..N-1 (InPool).
         size_t epochId = 0;
@@ -119,13 +148,13 @@ namespace JLib {
 
         void Join();
         JLIB_NOINLINE static Thread* GetCurrent();   // the thread-state accessor; see JLIB_NOINLINE
-        static void CoYield(Fiber* targetFiber, Pin pin = Pin::None);
+#undef Yield
+        static void Yield(Fiber* targetFiber, Pin pin = Pin::None);
         static void Suspend(Fiber* targetFiber, Pin pin = Pin::None);
         static void Resume(Fiber* targetFiber);
-        static void CoYield(Pin pin = Pin::None);
+        static void Yield(Pin pin = Pin::None);
         static void Suspend(Pin pin = Pin::None);
         static void Resume();
-        
         void NotifyWorker(bool force = false);
 
         void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
@@ -150,7 +179,19 @@ namespace JLib {
                 running.load(std::memory_order_relaxed)
             };
         }
+        // Runs every Local<T>'s destructor and frees it. Join calls it for each Thread, before the
+        // Thread's heap is released.
+        void DestroyLocals() noexcept;
+
     private:
+        void*  localObjs_[kMaxLocalTypes] = {};
+        void (*localDtors_[kMaxLocalTypes])(void*) = {};
+        static std::size_t NextLocalTypeId() noexcept;
+        template <class T> static std::size_t LocalTypeId() noexcept {
+            static const std::size_t id = NextLocalTypeId();
+            return id;
+        }
+
         Fiber* AcquireFiber(Task* task);
         void ReleaseFiber(Fiber* f);
 
@@ -161,15 +202,10 @@ namespace JLib {
 
         TaskScheduler* scheduler;
         
-        ThreadLocalCache<> localCache;                  
-        ThreadLocalCache<> tinyCache;
+        ThreadLocalCache<> localCache;
         ThreadLocalCache<> deepCache;
         ThreadLocalCache<>& CacheFor(StackClass c) {
-            switch (c) {
-                case StackClass::Tiny: return tinyCache;
-                case StackClass::Deep: return deepCache;
-                default:               return localCache;
-            }
+            return c == StackClass::Deep ? deepCache : localCache;
         }
         static thread_local Thread* instance;
 
@@ -225,4 +261,22 @@ namespace JLib {
     private:
         SlotEpochGuard slotted_;
     };
+
+    template <class T> T& Thread::Local() {
+        const std::size_t id = LocalTypeId<T>();
+        assert(id < kMaxLocalTypes && "Thread::Local: more distinct types than kMaxLocalTypes");
+        void*& slot = localObjs_[id];
+        if (!slot) {
+            // Only this thread builds its own copy (AllocAligned asserts this is the running thread).
+            void* mem = AllocAligned(sizeof(T), alignof(T) < alignof(std::max_align_t) ? alignof(std::max_align_t) : alignof(T));
+            slot = ::new (mem) T();
+            localDtors_[id] = [](void* p) { static_cast<T*>(p)->~T(); JLib::Free(p); };
+        }
+        return *static_cast<T*>(slot);
+    }
+
+    template <class T> T* Thread::PeekLocal() const noexcept {
+        const std::size_t id = LocalTypeId<T>();
+        return id < kMaxLocalTypes ? static_cast<T*>(localObjs_[id]) : nullptr;
+    }
 };

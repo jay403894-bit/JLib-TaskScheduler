@@ -42,9 +42,29 @@ ContextSwitch PROC
     push r14
     push r15
 
+    ; 1b. Save the TEB's stack bounds into the outgoing frame, so they travel with the context.
+    ; The TEB describes the RUNNING stack to the OS: the unwinder rejects any frame outside
+    ; [StackLimit, StackBase] (a C++ throw on a fiber then kills the process), and __chkstk walks
+    ; pages down from StackLimit for any frame over a page -- with the thread's own limit that walk
+    ; runs through memory that is not this stack. gs: is the CURRENT thread's TEB, so these reads
+    ; and the writes after the swap act on whichever worker runs the switch: migration-safe.
+    ; 3 values + 8 pad keep RSP 8 mod 16 for the block below.
+    ; JLIB_CTL_NO_TEB (negative control, diagnostic builds only): same 32-byte slot, no TEB access.
+IFNDEF JLIB_CTL_NO_TEB
+    mov rax, qword ptr gs:[8]        ; NT_TIB.StackBase (top)
+    push rax
+    mov rax, qword ptr gs:[10h]      ; NT_TIB.StackLimit (lowest committed)
+    push rax
+    mov rax, qword ptr gs:[1478h]    ; TEB.DeallocationStack (reservation base)
+    push rax
+    sub rsp, 8
+ELSE
+    sub rsp, 32
+ENDIF
+
     ; 2. Save Non-Volatile XMM Registers (6 through 15).
-    ; After 8 pushes RSP is 8 mod 16 -- the 'call' into here pushed an 8-byte return
-    ; address onto a 16-aligned stack, and 8*8 bytes preserve that offset. Reserve
+    ; After 8 pushes + the 32-byte TEB block RSP is 8 mod 16 -- the 'call' into here pushed an
+    ; 8-byte return address onto a 16-aligned stack, and 96 bytes preserve that offset. Reserve
     ; 168 = 160 (10 * 16 for xmm6-15) + 8 dummy: the extra 8 realigns RSP back to 16,
     ; so the XMM block is 16-aligned and movdqa (aligned) is legal. The dummy 8 bytes
     ; sit at [rsp+160 .. rsp+168), between the XMM block and the GPR pushes.
@@ -85,7 +105,20 @@ ContextSwitch PROC
     movdqa xmm13, [rsp + 112]
     movdqa xmm14, [rsp + 128]
     movdqa xmm15, [rsp + 144]
-    add rsp, 168      ; drop XMM block + dummy (back to the GPR pushes)
+    add rsp, 168      ; drop XMM block + dummy (back to the TEB block)
+
+    ; 4b. Install the incoming context's stack bounds in this thread's TEB (see 1b).
+IFNDEF JLIB_CTL_NO_TEB
+    add rsp, 8
+    pop rax
+    mov qword ptr gs:[1478h], rax
+    pop rax
+    mov qword ptr gs:[10h], rax
+    pop rax
+    mov qword ptr gs:[8], rax
+ELSE
+    add rsp, 32
+ENDIF
 
     ; 5. Restore Callee-Saved GPRs
     pop r15

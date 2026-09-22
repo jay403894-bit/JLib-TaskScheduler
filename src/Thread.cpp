@@ -15,8 +15,13 @@
 #include <cstdlib>
 #include <utility>   
 
+#if JLIB_PLATFORM_WINDOWS
+// WaitOnAddress/WakeByAddress live here. Named in the source because a static lib does not
+// carry link dependencies: without it the first EXE that links Scheduler.lib fails.
+#pragma comment(lib, "Synchronization.lib")
+#endif
 #if !JLIB_PLATFORM_WINDOWS
-#include <sys/resource.h>       
+#include <sys/resource.h>
 #endif
 #if JLIB_PLATFORM_LINUX
 #include <sys/syscall.h>        
@@ -40,6 +45,20 @@ namespace {
 
 using namespace JLib;
 thread_local Thread* Thread::instance = nullptr;
+
+namespace {
+	// Only main pumps, so a plain flag. Set while the app's pump runs: a window procedure that
+	// calls WaitFor lands back in Worker(), and pumping again from in there would re-enter the
+	// app's message loop from inside its own dispatch.
+	bool g_inPump = false;
+
+	void PumpMain(void (*pump)(std::uint32_t), std::uint32_t budgetUs) {
+		if (g_inPump) return;
+		struct Reset { ~Reset() { g_inPump = false; } } reset;   // a pump that throws still clears it
+		g_inPump = true;
+		pump(budgetUs);
+	}
+}
 
 #if defined(JLIBSCHED_STATS)
 namespace {
@@ -165,7 +184,6 @@ void Thread::AdoptCurrentThread(size_t fiberCacheCapacity)
 	}
 
 	localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Standard);
-	tinyCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Tiny);
 	deepCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Deep);
 
 	ready.store(true, std::memory_order_release);
@@ -296,15 +314,21 @@ void Thread::Join() {
 	joining.store(false, std::memory_order_release);
 }
 Thread* Thread::GetCurrent() {
+	// Opaque on purpose (see JLIB_NOINLINE in Thread.h): with only `return instance;` visible, GCC
+	// can prove this pure and reuse one result across a suspension in the caller -- the old
+	// thread's value. The empty asm stops that; MSVC does not do it to a noinline call.
+#if defined(__GNUC__) || defined(__clang__)
+	__asm__ __volatile__("" ::: "memory");
+#endif
 	return instance;
 }
 void Thread::ReleaseCurrentThread() noexcept {
 	if (instance == this) instance = nullptr;
 }
 
-void Thread::CoYield(Fiber* targetFiber, Pin pin){
+void Thread::Yield(Fiber* targetFiber, Pin pin){
 	if (targetFiber) {
-		targetFiber->CoYield(pin);
+		targetFiber->Yield(pin);
 	}
 }
 void Thread::Suspend(Fiber* targetFiber, Pin pin){
@@ -318,9 +342,9 @@ void Thread::Suspend(Fiber* targetFiber, Pin pin){
 	 }
 }
 
- void JLib::Thread::CoYield(Pin pin)
+ void JLib::Thread::Yield(Pin pin)
  {
-	 GetCurrent()->currentFiber->CoYield(pin);
+	 GetCurrent()->currentFiber->Yield(pin);
  }
 
  void JLib::Thread::Suspend(Pin pin)
@@ -424,8 +448,7 @@ bool Thread::HelpSteal() {
 	// main's helper -- so it only takes work that can never suspend (native tasks).
 	const bool pinned = TaskScheduler::PinForced();
 	auto ok = [pinned](StealBits sb) {
-		if (sb.type == TaskType::Main) return false;
-		return !pinned || sb.native;
+		return !pinned || sb.native();
 	};
 	auto s = scheduler->deques[stealCursor]->steal_if(ok);
 	if (!s || !*s) return false;
@@ -440,6 +463,7 @@ bool Thread::HelpSteal() {
 void Thread::RunHelped(Task* t) {
 	if (scheduler->DiscardIfCancelled(t)) return;
 	JLIB_STAT(RunHelper);
+	t->record->home = this;   // before the hand-over: see TaskRecord::home
 
 	if (t->type == TaskType::Coroutine) {
 		JLIB_STAT(RunCoroutine);
@@ -451,7 +475,7 @@ void Thread::RunHelped(Task* t) {
 		JLIB_STAT_ONLY(StatRunEnd(t0);)
 		return;
 	}
-	if (t->native) {
+	if (t->type == TaskType::Native) {
 		JLIB_STAT(RunLambda);
 		JLIB_STAT_ONLY(const std::uint64_t t0 = StatRunBegin(t);)
 		t->started = 1;
@@ -489,7 +513,6 @@ void Thread::RunHelped(Task* t) {
 	currentRunningTask = t;
 	currentFiber = f;
 	busy.store(true, std::memory_order_relaxed);
-	tsan::SwitchTo(f->tsanFiber);
 	ContextSwitch(&this->schedulerCtx, &f->ctx);
 	busy.store(false, std::memory_order_relaxed);
 	JLIB_STAT_ONLY(StatRunEnd(t0);)
@@ -618,19 +641,36 @@ bool Thread::Worker(WaitCtx* ctx) {
 		return result;
 	};
 
+	// The app's message pump (Config::pumpMain). isMain is only ever set with main in the pool, so
+	// out of the pool this stays null and main is left to pump itself.
+	const TaskScheduler::Config& cfg = TaskScheduler::CurrentConfig();
+	void (*const pump)(std::uint32_t) = isMain ? cfg.pumpMain : nullptr;
+	const std::uint32_t pumpEvery = cfg.pumpMainEvery ? cfg.pumpMainEvery : 1;
+	std::uint32_t pumpPass = 0;
+
 	enterHunt();
 
 	while (running.load(std::memory_order_acquire)) {
 
 		if (ctx && !task_to_run && ctx->Done()) return mainExit(true);
 
-#if !defined(JLIB_FIBERHOLDER_CTL_NO_WORKER_DRAIN)
-#endif  
-
 		const size_t kNow = TaskScheduler::GetHotWorkers();
-		
+
 		const size_t nAll = scheduler->workers.size();
 		const bool isReservedWorker = TaskScheduler::IsReservedIndex((size_t)qIndex, nAll);
+
+		if (!task_to_run) {
+			const std::int64_t now = MonotonicNs();
+#if !defined(JLIB_TIMER_CTL_NO_WORKER_POLL)
+			// The clock: any worker between tasks fires what is due. A clock read and a relaxed load when nothing is;
+			// TimerPollFire try-locks and never blocks.
+			if (TimerGateDue(now)) TimerPollFire();
+#endif
+			// No I/O poll here. Workers never touch the port: on Windows every look is a kernel call,
+			// and under a steady I/O load a gated poll still fires often. The reactor thread is the
+			// port's only reader and pumps completions into the injector, which this loop already
+			// takes from every pass with one load (tests/verify/kport_model.c).
+		}
 
 		auto drainOwnInbox = [&]() -> bool {
 			if (task_to_run || isReservedWorker) return false;
@@ -639,17 +679,15 @@ bool Thread::Worker(WaitCtx* ctx) {
 				++count;
 			if (count == 0) return false;
 
+			// push_bottom_batch grows rather than refusing (a failed grow is itself fatal), so a
+			// false here is a broken invariant -- same handling as DrainOwnInboxesToDeques.
 			const int keep = (int)count - 1;
-			if (keep == 0 || scheduler->deques[qIndex]->push_bottom_batch(batch, (size_t)keep)) {
-				JLIB_STAT_N(InboxStaged, keep);
-				JLIB_STAT(RunInbox);
-				task_to_run = batch[count - 1];
-				return true;
-			}
-			
-			for (size_t i = 0; i < count; ++i)
-				if (batch[i]) scheduler->Requeue(batch[i]);
-			return false;
+			if (keep > 0 && !scheduler->deques[qIndex]->push_bottom_batch(batch, (size_t)keep))
+				TaskDeque::FatalPushRefused();
+			JLIB_STAT_N(InboxStaged, keep);
+			JLIB_STAT(RunInbox);
+			task_to_run = batch[count - 1];
+			return true;
 		};
 
 		ready.store(true, std::memory_order_release);
@@ -677,17 +715,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 				continue;
 			}
 
-			// Main-thread work that reached any other thread goes back to main.
-			if (task_to_run->type == TaskType::Main && !isMain) {
-				assert(false && "a TaskType::Main task reached a non-main worker");
-				scheduler->PushMainQueue(task_to_run);
-				task_to_run = nullptr;
-				continue;
-			}
-
 			if (stolenHere
 			    && (!TaskScheduler::IoLaneQuiet()
-			        || !TaskScheduler::LaneIntakeIdle()
+			        || !TaskScheduler::InjectorIdle()
 			        || !scheduler->hiPriInboxes[qIndex]->quiescent())) {
 				TaskScheduler::NoteReservedStealReturned();
 				scheduler->Requeue(task_to_run);   // unstarted: placed on a compute worker
@@ -696,6 +726,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 			}
 
 			task_to_run->started = 1;
+#if !defined(JLIB_HOME_CTL_NO_UPDATE)   // negative control for tests/home_alloc_test.cpp
+			task_to_run->record->home = this;   // before the hand-over: see TaskRecord::home
+#endif
 
 			// Coroutine: resumed by a plain call on this stack. The frame owns the task from here:
 			// on suspend an awaiter has already handed it to a waiter (it may be running elsewhere
@@ -718,7 +751,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 
 			// Native (lambda or CreateNativeTask): direct call on this stack, no fiber. It may never
 			// suspend (fatal at every wait point). Everything else runs on a fiber.
-			if (task_to_run->native) {
+			if (task_to_run->type == TaskType::Native) {
 				currentRunningTask = task_to_run;
 				JLIB_STAT(RunLambda);
 				JLIB_STAT_ONLY(const std::uint64_t t0 = StatRunBegin(task_to_run);)
@@ -749,10 +782,10 @@ bool Thread::Worker(WaitCtx* ctx) {
 				f = AcquireFiber(task_to_run);
 				if (!f) {
 					JLIB_STAT(NoFiberRequeue);
-					{
-						
-						scheduler->Requeue(task_to_run);
-					}
+					// Unstarted, so its only placement is where it was queued. Main gives it back to
+					// itself: it may have come in through PushMain, and nothing else records that.
+					if (isMain) scheduler->PushMainQueue(task_to_run);
+					else        scheduler->Requeue(task_to_run);
 					
 					task_to_run = nullptr;
 					std::this_thread::yield();
@@ -772,7 +805,6 @@ bool Thread::Worker(WaitCtx* ctx) {
 			busy.store(true, std::memory_order_relaxed);
 			{
 				
-				tsan::SwitchTo(f->tsanFiber);
 				ContextSwitch(&this->schedulerCtx, &f->ctx);
 	
 			}
@@ -784,9 +816,19 @@ bool Thread::Worker(WaitCtx* ctx) {
 
 			task_to_run = nullptr;
 		}
-		
+
+		// Every pass reaches here empty-handed: just after running a task, or having come in with
+		// none. So the count is passes, hit or miss -- a main that keeps finding work would never
+		// miss, and would starve its window as surely as one asleep. (Not at the top of the loop:
+		// after a fiber task, the find below takes the next one in the same pass, so the top only
+		// ever sees an empty hand on a miss.)
+		if (pump && ++pumpPass >= pumpEvery) {
+			pumpPass = 0;
+			PumpMain(pump, cfg.pumpMainBudgetUs);
+		}
+
 		{
-			
+
 			enterHunt();
 
 			if (isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent()) {
@@ -800,8 +842,8 @@ bool Thread::Worker(WaitCtx* ctx) {
 			}
 			
 			if (!task_to_run && isReservedWorker) {
-				if (Task* shared = TaskScheduler::TakeLaneIntake()) {
-					JLIB_STAT(RunLaneIntake);
+				if (Task* shared = TaskScheduler::TakeInjector()) {
+					JLIB_STAT(RunInjector);
 					task_to_run = shared;
 				}
 			}
@@ -822,6 +864,18 @@ bool Thread::Worker(WaitCtx* ctx) {
 					task_to_run = hp;
 					JLIB_STAT(RunHiPri);
 					continue;   // took a task: run it before anything below can overwrite task_to_run
+				}
+			}
+
+			// The injector: I/O completions and other work any worker may run, checked every pass
+			// right after this thread's own pinned work -- the clock gate's shape (one load of the
+			// count when empty), so a busy worker picks it up at its next task boundary instead of
+			// a sleeping thread being woken for it. K took its turn above.
+			if (!task_to_run && !isReservedWorker) {
+				if (Task* inj = TaskScheduler::TakeInjector()) {
+					JLIB_STAT(RunInjector);
+					task_to_run = inj;
+					continue;
 				}
 			}
 
@@ -1009,7 +1063,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
-						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())))) {
+						|| !TaskScheduler::InjectorIdle()))) {   // every worker reads the injector
 
 				if (!running.load(std::memory_order_acquire)) break;
 
@@ -1060,9 +1114,9 @@ bool Thread::Worker(WaitCtx* ctx) {
 					//
 					// kHotPasses is a duration, not a count: a pass is ~100 ns, so ~2000 of them is
 					// ~200 us of full-speed hunting after the last task ran.
-					// K never parks: it stays up the same way. A parked K costs latency work a full
-					// OS wake -- measured 10-85 us p50 (up to ~300 us p99) against 0.6-5 us awake --
-					// and, being off the idle stack, it would never be woken to steal compute.
+					// K never parks: it stays up the same way. A parked K costs latency work a full OS
+					// wake -- measured 10-85 us p50 (up to ~300 us p99) against 0.6-5 us awake -- and,
+					// being off the idle stack, it would never be woken to steal compute.
 					if (!tryLeaveHuntForPark() || isReservedWorker) {
 						constexpr unsigned kHotPasses = 2000;
 						if (idleSpins < kHotPasses) {
@@ -1100,7 +1154,8 @@ bool Thread::Worker(WaitCtx* ctx) {
 							|| scheduler->deques[qIndex]->size_approx() != 0
 							|| hasQueuedWork.load(std::memory_order_seq_cst)
 							|| !scheduler->hiPriInboxes[qIndex]->quiescent()
-							|| !scheduler->normalInboxes[qIndex]->quiescent()) {
+							|| !scheduler->normalInboxes[qIndex]->quiescent()
+							|| !TaskScheduler::InjectorIdle()) {   // main helps with injected work too
 							mainWait.store(kWaitRunning, std::memory_order_seq_cst);
 							enterHunt();
 							if (!running.load(std::memory_order_acquire)) break;
@@ -1156,7 +1211,7 @@ bool Thread::Worker(WaitCtx* ctx) {
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
 						
 						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
-						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())
+						|| (!isReservedWorker && !TaskScheduler::InjectorIdle())   // compute workers read it; K does not
 						// Nobody is hunting any more. This worker left the hunt BEFORE it was on
 						// the idle stack, so a LeaveHunt that took `searching` 1->0 in that gap
 						// found no one to hand off to -- and work pushed onto a busy worker's own
@@ -1185,13 +1240,13 @@ bool Thread::Worker(WaitCtx* ctx) {
 					while (workerState.load(std::memory_order_seq_cst) == WS_PARKED
 					       && running.load(std::memory_order_acquire)) {
 #if defined(JLIB_PLATFORM_WINDOWS)
-						
+
 						::WaitOnAddress(&workerState, &sleeping, sizeof(int), INFINITE);
 #elif JLIB_PLATFORM_LINUX
-						
+
 						FutexWait(&workerState, sleeping);
 #else
-						
+
 						#error "JLib::Scheduler needs WaitOnAddress (Windows) or futex (Linux)"
 #endif
 					}

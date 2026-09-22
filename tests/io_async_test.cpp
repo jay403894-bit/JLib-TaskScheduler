@@ -64,16 +64,21 @@ static void Reset() {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const bool pin = argc > 1 && std::strchr(argv[1], 'p');
+    // k: one reserved worker, which then sleeps in the port (the port-waiter path).
+    const bool withK = argc > 1 && std::strchr(argv[1], 'k');
 
     JLib::TaskScheduler::Config cfg;
     cfg.mode = pin ? JLib::Mode::Pinned : JLib::Mode::Migrate;
     cfg.main = JLib::MainMode::OutOfPool;
-    cfg.io   = true;
+    cfg.timers = true;   // the Deadline cases below need the timer layer; I/O itself does not
+    if (withK) cfg.hotWorkers = 1;
     JLib::TaskScheduler::Init(cfg);
     auto& sched = JLib::TaskScheduler::Instance();
     auto& io = JLib::IoReactor::Instance();
+    io.Start();   // the opt-in: starts the pump; Join stops it
 
-    std::printf("IoReactor via co_await -- workers=%zu\n\n", sched.GetWorkerCount());
+    std::printf("IoReactor via co_await -- workers=%zu K=%zu\n\n", sched.GetWorkerCount(),
+                JLib::TaskScheduler::GetHotWorkers());
     Check(JLib::IoReactor::IsAvailable(), "the reactor is implemented on this platform");
 
     char path[MAX_PATH];

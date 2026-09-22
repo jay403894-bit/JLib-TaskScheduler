@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause
+﻿// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #include "TaskScheduler.h"
@@ -168,7 +168,7 @@ static JLib::Coro AwaitsGroup(std::atomic<int>* done, std::atomic<int>* after, i
     JLib::WaitGroup inner;
     inner.n.store(n, std::memory_order_relaxed);
     for (int i = 0; i < n; ++i) {
-        JLib::Task* t = s.CreateTask(&SlowBody, done);
+        JLib::Task* t = s.CreateTask(&SlowBody, done, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->waitGroup = &inner;
         s.Push(t);
     }
@@ -487,7 +487,7 @@ int main(int argc, char** argv) {
         JLib::WaitGroup fiberWg;
         fiberWg.n.store(4, std::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
-            auto* t = sched.CreateTask(&MutexFiber, &fx);
+            auto* t = sched.CreateTask(&MutexFiber, &fx, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }
@@ -527,7 +527,7 @@ int main(int argc, char** argv) {
         JLib::WaitGroup fiberWg;
         fiberWg.n.store(4, std::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
-            auto* t = sched.CreateTask(&SemaphoreFiber, &fx);
+            auto* t = sched.CreateTask(&SemaphoreFiber, &fx, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }

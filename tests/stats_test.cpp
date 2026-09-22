@@ -62,7 +62,7 @@ int main() {
 	Check(fibers >= (uint64_t)(kFiber + kSusp) && fibers <= (uint64_t)(kFiber + 2 * kSusp), "fiber runs = fibers + resumes");
 	Check(coros == (uint64_t)(2 * kCoro), "coroutine runs = two segments each");
 	const uint64_t bySource = snap.Count(Stat::RunOwnDeque) + snap.Count(Stat::RunInbox) + snap.Count(Stat::RunHiPri)
-	                        + snap.Count(Stat::RunStolen) + snap.Count(Stat::RunMainQueue) + snap.Count(Stat::RunLaneIntake)
+	                        + snap.Count(Stat::RunStolen) + snap.Count(Stat::RunMainQueue) + snap.Count(Stat::RunInjector)
 	                        + snap.Count(Stat::RunHelper);
 	Check(bySource == lambdas + fibers + coros, "every run has exactly one source");
 	Check(snap.Count(Stat::Suspends) >= (uint64_t)(kSusp + kCoro), "suspends counted (fibers and coroutines)");

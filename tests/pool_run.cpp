@@ -358,8 +358,8 @@ int main(int argc, char** argv) {
 			std::this_thread::yield();
 
 		const int got = lowRan.load(std::memory_order_acquire);
-		std::fprintf(stderr, "        K=%zu  laneIntake=%s  ran=%d\n",
-			k, sched.LaneIntakeEnabled() ? "on" : "off", got);
+		std::fprintf(stderr, "        K=%zu  injector=%s  ran=%d\n",
+			k, sched.InjectorEnabled() ? "on" : "off", got);
 		std::fflush(stderr);
 		if (got == 0) {
 			std::fprintf(stderr,

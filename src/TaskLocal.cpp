@@ -61,18 +61,22 @@ namespace JLib {
 	}
 
 	// ---- debts owed at task death ----
+	//
+	// A dying record hands its list to a global stack, and one pool task drains it. Not run inline
+	// at death because a release function is the caller's code: it may allocate, take a lock, or
+	// touch the scheduler, none of which belong on the path that is freeing a record.
 
 	static std::atomic<bool>       g_reclaimQueued{ false };
-	static std::atomic<FiberDebt*> g_pendingDebts{ nullptr };
+	static std::atomic<TaskDebt*> g_pendingDebts{ nullptr };
 
 	namespace detail {
-		void HandOffFiberDebts(FiberDebt* head) noexcept {
+		void HandOffTaskDebts(TaskDebt* head) noexcept {
 			if (!head) return;
 
-			FiberDebt* tail = head;
+			TaskDebt* tail = head;
 			while (tail->next) tail = tail->next;
 
-			FiberDebt* old = g_pendingDebts.load(std::memory_order_relaxed);
+			TaskDebt* old = g_pendingDebts.load(std::memory_order_relaxed);
 			do {
 				tail->next = old;
 			} while (!g_pendingDebts.compare_exchange_weak(old, head,
@@ -83,10 +87,10 @@ namespace JLib {
 	}
 
 	static size_t ReleasePendingDebts() {
-		FiberDebt* d = g_pendingDebts.exchange(nullptr, std::memory_order_acq_rel);
+		TaskDebt* d = g_pendingDebts.exchange(nullptr, std::memory_order_acq_rel);
 		size_t n = 0;
 		while (d) {
-			FiberDebt* nxt = d->next;
+			TaskDebt* nxt = d->next;
 			d->next = nullptr;
 			if (d->release && d->obj) d->release(d->obj);
 			++n;

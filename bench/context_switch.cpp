@@ -26,6 +26,7 @@ using PreFn = void (*)();
 extern "C" {
     
     void CsSse(Context*, Context*);
+    void CsSseNoTeb(Context*, Context*);
     void CsSseVzu(Context*, Context*);
     void CsAvx(Context*, Context*);
 
@@ -119,12 +120,51 @@ extern "C" unsigned char JLibCtxHasAvx;
 std::atomic<long long> g_wakes{ 0 };
 PreFn volatile         g_schedPre = nullptr;
 
+// PLACEMENT: which core type each woken worker lands on. Hybrid parts report an EfficiencyClass per
+// logical CPU (higher = performance core); a non-hybrid CPU has one class, and every wake counts as P.
+// Suspected cause of the dirty/clean gap in the pool rows: Thread Director steering a thread that
+// looks vector-heavy toward P-cores.
+std::vector<unsigned char>  g_cpuClass;
+unsigned char               g_maxClass = 0;
+bool                        g_hybrid   = false;
+std::atomic<long long>      g_wakeP{ 0 }, g_wakeE{ 0 };
+
+void BuildCpuClasses() {
+    ULONG len = 0;
+    ::GetSystemCpuSetInformation(nullptr, 0, &len, ::GetCurrentProcess(), 0);
+    std::vector<char> buf(len);
+    if (!len || !::GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()),
+                                              len, &len, ::GetCurrentProcess(), 0)) return;
+    unsigned char minClass = 255;
+    for (char* p = buf.data(); p < buf.data() + len;) {
+        auto* i = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(p);
+        if (i->Type == CpuSetInformation) {
+            const size_t idx = (size_t)i->CpuSet.Group * 64 + i->CpuSet.LogicalProcessorIndex;
+            if (g_cpuClass.size() <= idx) g_cpuClass.resize(idx + 1, 0);
+            g_cpuClass[idx] = i->CpuSet.EfficiencyClass;
+            g_maxClass = std::max(g_maxClass, i->CpuSet.EfficiencyClass);
+            minClass   = std::min(minClass,   i->CpuSet.EfficiencyClass);
+        }
+        p += i->Size;
+    }
+    g_hybrid = minClass != g_maxClass;
+}
+
+void NoteWakeCore() {
+    PROCESSOR_NUMBER pn;
+    ::GetCurrentProcessorNumberEx(&pn);
+    const size_t idx = (size_t)pn.Group * 64 + pn.Number;
+    const bool onP = idx < g_cpuClass.size() && g_cpuClass[idx] == g_maxClass;
+    (onP ? g_wakeP : g_wakeE).fetch_add(1, std::memory_order_relaxed);
+}
+
 struct ParkCtx { JLib::TaskScheduler* sched; JLib::Event* ev; long long iters; };
 static void ParkLoopBody(void* p) {
     auto& c = *static_cast<ParkCtx*>(p);
     for (long long i = 0; i < c.iters; ++i) {
-        g_schedPre();                 
+        g_schedPre();
         c.sched->WaitOnEvent(*c.ev);
+        NoteWakeCore();               // on the worker that just resumed this fiber
         g_wakes.fetch_add(1, std::memory_order_release);
     }
 }
@@ -230,6 +270,7 @@ int main(int argc, char** argv) {
     std::printf("\ncorrectness gate (each variant round-trips XMM6-15 past a deliberate clobber)\n");
     bool ok = true;
     ok &= VerifyVariant(&CsSse,        "movdqa (bench copy)");
+    ok &= VerifyVariant(&CsSseNoTeb,   "movdqa, no TEB swap");
     ok &= VerifyVariant(&ContextSwitch,"movdqa (shipped library symbol)");
     ok &= VerifyVariant(&CsSseVzu,     "vzeroupper + movdqa");
     ok &= VerifyVariant(&CsAvx,        "vmovdqa (VEX)");
@@ -248,6 +289,9 @@ int main(int argc, char** argv) {
         { "movdqa            CLEAN upper", &CsSse,         &BenchCleanUpper, "the floor -- no dirty state to transition out of" },
         
         { "SHIPPED [library] CLEAN upper", &ContextSwitch, &BenchCleanUpper, "what the fix COSTS a non-AVX workload" },
+        { "movdqa +TEB swap  CLEAN upper", &CsSse,         &BenchCleanUpper, "TEB A/B: as shipped (StackBase/Limit/Dealloc swapped)" },
+        { "movdqa  no TEB    CLEAN upper", &CsSseNoTeb,    &BenchCleanUpper, "TEB A/B: same frame, no gs: accesses" },
+        { "movdqa +TEB swap  CLEAN upper", &CsSse,         &BenchCleanUpper, "TEB A/B: repeat of the first arm (control)" },
     };
     const int kRows = int(sizeof rows / sizeof rows[0]);
 
@@ -288,6 +332,13 @@ int main(int argc, char** argv) {
             std::printf("    focus changed mid-run -- this run is uninterpretable, re-run it.\n");
     }
 
+    {   // the TEB A/B: the last three rows
+        const double teb = Median(samples[kRows - 3]), noTeb = Median(samples[kRows - 2]),
+                     again = Median(samples[kRows - 1]);
+        std::printf("\n==> TEB stack-bound swap costs %.2f ns per switch (%.1f%%); control repeat %.2f ns\n",
+                    teb - noTeb, noTeb > 0 ? 100.0 * (teb - noTeb) / noTeb : 0.0, again - teb);
+    }
+
     const double ctrl = Median(samples[1]) / base;
     if (ctrl < 0.98 || ctrl > 1.02)
         std::printf("    SAME-VS-SAME CONTROL READS %.3fx -- the harness is not resolving this\n"
@@ -316,24 +367,37 @@ int main(int argc, char** argv) {
 
     for (int r = 0; r < kSRows; ++r) (void)TimeSuspendResume(srows[r].gate, srows[r].pre, 2000);
 
+    BuildCpuClasses();
     std::vector<std::vector<double>> ss(kSRows);
+    std::vector<long long> wakesP(kSRows, 0), wakesE(kSRows, 0);
     for (int rep = 0; rep < srReps; ++rep)
-        for (int r = 0; r < kSRows; ++r)
+        for (int r = 0; r < kSRows; ++r) {
+            g_wakeP.store(0, std::memory_order_relaxed);
+            g_wakeE.store(0, std::memory_order_relaxed);
             ss[r].push_back(TimeSuspendResume(srows[r].gate, srows[r].pre, srIters));
+            wakesP[r] += g_wakeP.load(std::memory_order_relaxed);
+            wakesE[r] += g_wakeE.load(std::memory_order_relaxed);
+        }
 
     const double sbase = Median(ss[0]);
-    std::printf("\n%-30s %10s %10s %8s   %s\n", "", "median ns", "min ns", "ratio", "");
+    std::printf("\n%-30s %10s %10s %8s %8s   %s\n", "", "median ns", "min ns", "ratio",
+                g_hybrid ? "P wakes" : "", "");
     for (int r = 0; r < kSRows; ++r) {
         const double med = Median(ss[r]);
         const double mn  = *std::min_element(ss[r].begin(), ss[r].end());
-        std::printf("%-30s %10.1f %10.1f %7.3fx   %s\n",
-                    srows[r].label, med, mn, med / sbase, srows[r].note);
+        const long long all = wakesP[r] + wakesE[r];
+        char pct[16] = "";
+        if (g_hybrid && all) std::snprintf(pct, sizeof pct, "%5.1f%%", 100.0 * wakesP[r] / all);
+        std::printf("%-30s %10.1f %10.1f %7.3fx %8s   %s\n",
+                    srows[r].label, med, mn, med / sbase, pct, srows[r].note);
     }
+    if (!g_hybrid) std::printf("    (not a hybrid CPU: no P/E placement to report)\n");
 
-    std::printf("\n    saves %+.0f ns per Event round trip on an AVX fiber    (row 1 - row 2)\n"
-                "    costs %+.0f ns per Event round trip on a non-AVX one  (row 4 - row 3)\n"
+    // Signed so a reader cannot misread it: + means the gate makes the round trip SLOWER.
+    std::printf("\n    gate changes an AVX fiber's round trip by   %+.0f ns   (row 2 - row 1; + = slower)\n"
+                "    gate changes a non-AVX fiber's round trip by %+.0f ns   (row 4 - row 3; + = slower)\n"
                 "    two switches' worth either way; compare against %.0f ns of raw switch delta.\n",
-                Median(ss[0]) - Median(ss[1]),
+                Median(ss[1]) - Median(ss[0]),
                 Median(ss[3]) - Median(ss[2]),
                 2.0 * (Median(samples[0]) - Median(samples[2])));
 

@@ -1,4 +1,4 @@
-// TaskRecord: task-local storage and release-on-death debts. Arg 'p' = Pin mode.
+﻿// TaskRecord: task-local storage and release-on-death debts. Arg 'p' = Pin mode.
 // (Holder-affine debts and the record cleanup hop were removed 2026-09-19: nothing in the library
 // ever created one, and the holder queues they fed cost three checks in the park gate.)
 #include <TaskScheduler.h>
@@ -34,11 +34,11 @@ static std::atomic<int> g_tlsDeleted{ 0 }, g_tlsBad{ 0 }, g_tlsOk{ 0 }, g_tlsMig
 static void TlsDeleter(void* p) { delete static_cast<int*>(p); g_tlsDeleted.fetch_add(1); }
 static void TlsBody(void* arg) {
 	const int id = (int)(intptr_t)arg;
-	TaskScheduler::FiberLocal(g_slot) = new int(id);
+	TaskLocalSet(g_slot, new int(id));
 	const int q0 = CurQ();
 	for (int i = 0; i < 3; ++i) {
-		Thread::CoYield();
-		int* p = static_cast<int*>(TaskScheduler::FiberLocal(g_slot));
+		Thread::Yield();
+		int* p = static_cast<int*>(TaskLocalGet(g_slot));
 		if (!p || *p != id) { g_tlsBad.fetch_add(1); return; }
 	}
 	if (CurQ() != q0) g_tlsMigrated.fetch_add(1);
@@ -50,7 +50,7 @@ static void TlsBody(void* arg) {
 static std::atomic<int> g_anyReleased{ 0 };
 static void AnyRelease(void*) noexcept { g_anyReleased.fetch_add(1); }
 static void AnyBody(void* p) {
-	TaskScheduler::ReleaseOnFiberDeath(*static_cast<FiberDebt*>(p), p, &AnyRelease);
+	TaskScheduler::ReleaseOnTaskDeath(*static_cast<TaskDebt*>(p), p, &AnyRelease);
 }
 
 int main(int argc, char** argv) {
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
 
 	std::printf("[task-local storage follows the task]\n");
 	{
-		g_slot = TaskScheduler::AllocFiberLocalSlot();
+		g_slot = AllocTaskLocalSlot();
 		SetTaskLocalDeleter(g_slot, &TlsDeleter);
 		const int N = 2000;
 		WaitGroup wg; wg.n.store(N);
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
 	std::printf("[release-on-death debts]\n");
 	{
 		const int N = 2000;
-		std::vector<FiberDebt> nodes(N);
+		std::vector<TaskDebt> nodes(N);
 		WaitGroup wg; wg.n.store(N);
 		for (int i = 0; i < N; ++i) {
 			Task* t = s.CreateTask(&AnyBody, &nodes[i], Lane::Normal, TaskType::Fiber);

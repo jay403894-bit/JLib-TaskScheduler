@@ -34,27 +34,27 @@
 ; restoring it after that fiber resumes on a different worker would install a stale TEB pointer on a
 ; thread that did nothing wrong, corrupting thread-local state and surfacing later as
 ; nondeterministic damage in unrelated code. So x18 must be left exactly as the running thread left
-; it: not saved, not restored, not read. Do not "complete" the register set by adding it.
+; it: not saved and not restored (step 1b READS it, as the base of the TEB it points at). Do not
+; "complete" the register set by adding it.
 ;
-; NO TEB StackBase/StackLimit FIXUP, deliberately, matching the shipped x64 port.
-; An earlier CMake comment asserted the x64 MASM performs this fixup. It does not -- there is no TEB
-; access anywhere in src/win32/. This port matches that behaviour rather than inventing a third one.
-; The consequence is the same on both: because the TEB still describes the worker's ORIGINAL stack,
-; an overflow off a fiber stack arrives as an access violation on the arena's guard page rather than
-; as a proper stack-overflow exception, and SEH across a fiber boundary is correspondingly limited.
-; That is the normal trade for lightweight fibers (boost.context makes it too) and it has shipped on
-; x64 for the life of this library. If it is ever fixed, fix BOTH ports together.
+; TEB StackBase/StackLimit/DeallocationStack ARE swapped (step 1b / 5b), as on x64: the bounds are
+; saved in the outgoing frame and the incoming frame's are written into the running thread's TEB.
+; Without it the unwinder rejects every frame on a fiber (a C++ throw kills the process) and
+; __chkstk probes from the wrong limit. Keep both ports in step.
+; NOT ASSEMBLED HERE: this machine has no ARM64 toolset. Build and run tests/fiber_exception_test
+; on ARM64 hardware before trusting it.
 ;
 ; ALIGNMENT: AArch64 requires SP 16-byte aligned at ALL times, not just at call boundaries -- a
 ; misaligned SP faults on any stack access. Every stp/str below moves SP by a multiple of 16.
 ;
-; FRAME LAYOUT at the saved SP (low to high) -- 176 bytes (64 FP + 16 FPCR+pad + 96 GPR):
-;     +0    d8,  d9        +80   x19, x20
-;     +16   d10, d11       +96   x21, x22
-;     +32   d12, d13       +112  x23, x24
-;     +48   d14, d15       +128  x25, x26
-;     +64   FPCR (low 32)  +144  x27, x28
-;     +72   pad            +160  x29 (FP), x30 (LR)
+; FRAME LAYOUT at the saved SP (low to high) -- 208 bytes (64 FP + 16 FPCR + 32 TEB + 96 GPR):
+;     +0    d8,  d9        +112  x19, x20
+;     +16   d10, d11       +128  x21, x22
+;     +32   d12, d13       +144  x23, x24
+;     +48   d14, d15       +160  x25, x26
+;     +64   FPCR, pad      +176  x27, x28
+;     +80   Dealloc, pad   +192  x29 (FP), x30 (LR)
+;     +96   Limit, Base
 
     AREA    |.text|, CODE, READONLY
 
@@ -75,6 +75,15 @@ ContextSwitch PROC
     stp     x23, x24, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
     stp     x19, x20, [sp, #-16]!
+
+    ; 1b. The TEB's stack bounds, saved into the outgoing frame (see the x64 port, step 1b).
+    ; x18 is READ as a base pointer only -- it is the current thread's TEB, which is exactly the
+    ; TEB these bounds must be written back into after the swap. It is never saved or restored.
+    ldr     x9,  [x18, #8]          ; NT_TIB.StackBase
+    ldr     x10, [x18, #16]         ; NT_TIB.StackLimit
+    stp     x10, x9, [sp, #-16]!
+    ldr     x9,  [x18, #0x1478]     ; TEB.DeallocationStack
+    str     x9,  [sp, #-16]!        ; + 8 pad
 
     ; 2. FP CONTROL register. FPCR is per-thread state shared by every fiber on a worker, exactly
     ; like MXCSR on x86 -- a fiber that changes rounding mode or flush-to-zero and then yields would
@@ -108,6 +117,13 @@ ContextSwitch PROC
     ; Writing FPCR needs a context-synchronisation event before dependent FP instructions are
     ; guaranteed to see it. The 'ret' below provides one, so no explicit isb is needed HERE -- but
     ; one would be required if any FP work were ever added between this point and the return.
+
+    ; 5b. Install the incoming context's stack bounds in this thread's TEB.
+    ldr     x9,  [sp], #16
+    str     x9,  [x18, #0x1478]
+    ldp     x10, x9, [sp], #16
+    str     x10, [x18, #16]
+    str     x9,  [x18, #8]
 
     ldp     x19, x20, [sp], #16
     ldp     x21, x22, [sp], #16

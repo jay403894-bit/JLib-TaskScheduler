@@ -1,4 +1,4 @@
-// SchedulerSemaphore and SchedulerConditionVariable. Arg "p" = Mode::Pinned.
+﻿// SchedulerSemaphore and SchedulerConditionVariable. Arg "p" = Mode::Pinned.
 // Targets: a signal racing a newly queued waiter (the banked-permit lost wake), a notify racing a
 // cancelled CV waiter (its semaphore lives on that fiber's stack), and pin-correct cancel wakes.
 // Build with -DJLIBSCHED_COROUTINES=1 against the coroutine library.
@@ -86,7 +86,7 @@ static void Spawn(void (*fn)(void*), int n, WaitGroup& wg, uint32_t token = Canc
 	auto& s = TaskScheduler::Instance();
 	wg.n.fetch_add(n);
 	for (int i = 0; i < n; ++i) {
-		Task* t = s.CreateTask(fn, nullptr);
+		Task* t = s.CreateTask(fn, nullptr, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &wg;
 		t->cancelToken = token;
 		s.Push(t);

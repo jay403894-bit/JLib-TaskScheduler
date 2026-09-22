@@ -10,21 +10,21 @@
 using namespace JLib;
 
 namespace {
-	constexpr size_t kMinBlock[3]  = { 64, 64, 8 };      // indexed by StackClass
+	constexpr size_t kMinBlock[] = { 64, 8 };   // indexed by StackClass: Standard, Deep
 	constexpr size_t kMaxBlockBytes = 64u * 1024 * 1024;
 
 	const char* ClassName(StackClass c) {
-		return c == StackClass::Tiny ? "tiny" : c == StackClass::Deep ? "deep" : "standard";
+		return c == StackClass::Deep ? "deep" : "standard";
 	}
 }
 
-GlobalFiberPool::GlobalFiberPool(size_t tinyCount, size_t standardCount, size_t deepCount,
-                                 size_t limit)
+GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t deepCount, size_t limit)
 	: memoryLimit(limit)
 {
-	const StackClass order[kClassCount] =
-		{ StackClass::Standard, StackClass::Tiny, StackClass::Deep };
-	const size_t counts[kClassCount] = { standardCount, tinyCount, deepCount };
+	static_assert(sizeof(kMinBlock) / sizeof(kMinBlock[0]) == kClassCount,
+	              "kMinBlock needs one entry per StackClass");
+	const StackClass order[kClassCount] = { StackClass::Standard, StackClass::Deep };
+	const size_t counts[kClassCount]    = { standardCount, deepCount };
 
 	std::lock_guard<std::mutex> lock(poolMutex);
 	for (size_t k = 0; k < kClassCount; ++k) {
@@ -54,10 +54,9 @@ GlobalFiberPool::~GlobalFiberPool() {
 		}
 }
 
-GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount, size_t tinyCount, size_t deepCount,
-                                         size_t memoryLimit)
+GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount, size_t deepCount, size_t memoryLimit)
 {
-	return new GlobalFiberPool(tinyCount, standardCount, deepCount, memoryLimit);
+	return new GlobalFiberPool(standardCount, deepCount, memoryLimit);
 }
 
 bool GlobalFiberPool::AddBlock(StackClass c, size_t count) {
@@ -85,7 +84,6 @@ bool GlobalFiberPool::AddBlock(StackClass c, size_t count) {
 		f.stackSize  = region;
 		f.stackClass = c;
 		f.poolIndex  = nextIndex++;
-		f.tsanFiber  = tsan::CreateFiber();
 	}
 	if (made == 0) {
 		FreeFiberStorage(b.fibers, 0);

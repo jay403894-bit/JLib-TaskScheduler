@@ -5,6 +5,7 @@
 #include "CancelToken.h"
 #include "Task.h"   // Lane
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -18,6 +19,28 @@ namespace JLib {
 
     using TimerEject = void (*)(void* ctx, CancelToken token);
     class Periodic;
+
+    // ---- the worker-loop gate ------------------------------------------------------------
+    //
+    // A sleeping clock cannot hold a fine grid: its wake lands 0.3-0.5 ms late idle and about
+    // twice that under load (see Run() in Timer.cpp), which a 4 ms period absorbs and a 1 ms
+    // period does not. Workers are the one thing already awake, so they check the wheel at the
+    // top of each pass and fire what is due in place -- no wake, and no push for a trivial body.
+    //
+    // g_timerGateNs is the absolute ns of the earliest armed deadline, INT64_MAX when nothing is
+    // armed. It is an ADVISORY HINT: written only under the timer mutex, read relaxed here, and
+    // re-checked under that mutex by whoever acts on it. Stale-early costs one failed try_lock;
+    // stale-late is covered by the timer thread, which still runs and still sleeps to the same
+    // boundary. Correctness never depends on a worker observing it.
+    namespace detail { extern std::atomic<int64_t> g_timerGateNs; }
+
+    inline bool TimerGateDue(int64_t nowNs) noexcept {
+        return nowNs >= detail::g_timerGateNs.load(std::memory_order_relaxed);
+    }
+
+    // Fire whatever the wheel owes, from a worker. NEVER BLOCKS: if the timer mutex is held then
+    // someone else is already firing, and the caller goes straight back to its own work.
+    bool TimerPollFire() noexcept;
 
     struct TimerHandle {
         uint64_t raw = 0;
@@ -41,6 +64,7 @@ namespace JLib {
 
     private:
         friend class Periodic;
+        friend bool TimerPollFire() noexcept;   // reaches impl->PollFire()
         TimerQueue();
         ~TimerQueue();
         TimerQueue(const TimerQueue&) = delete;

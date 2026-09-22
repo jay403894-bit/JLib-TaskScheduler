@@ -103,6 +103,13 @@ namespace JLib {
         extern std::atomic<std::uint64_t> g_ioToLane;
         extern std::atomic<std::uint64_t> g_ioToFloor;
         extern std::atomic<std::uint64_t> g_ioFloorFallback;
+
+        // ---- Completions reach the pool through the injector ----
+        // The reactor's pump thread is the port's only reader: it sleeps in the port, moves every
+        // completion into the injector with no wake, and goes back. Workers take from the injector
+        // each pass and never touch the port (tests/verify/kport_model.c).
+
+        extern std::atomic<std::size_t>  g_ioOutstanding;   // requests submitted, not yet completed
     }
 
     class IoReactor {

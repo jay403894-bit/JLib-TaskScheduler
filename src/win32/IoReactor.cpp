@@ -134,23 +134,37 @@ namespace JLib {
 
         struct Shard {
             mutable IoMutex m;
-            IoRequest* head = nullptr;      
-            
+            IoRequest* head = nullptr;
+
             char pad[platform::kCacheLine];
         };
 
         Shard shards[kShards];
-        std::atomic<std::size_t> total{ 0 };     
 
         Shard& ShardFor(const IoRequest* r) noexcept {
             const std::uintptr_t x = reinterpret_cast<std::uintptr_t>(r) >> 4;
             return shards[(x * 2654435761u) % kShards];
         }
 
-        std::mutex life;                          
-        std::vector<std::thread> workers;
-        bool running = false;
-        std::atomic<bool> stopping{ false };      
+        std::mutex life;
+        // Starts TRUE: until Start() there is no pump, so a submit must be refused
+        // (ERROR_SHUTDOWN_IN_PROGRESS) rather than accepted into a port nobody reads.
+        std::atomic<bool> stopping{ true };
+
+        // THE PUMP: a plain thread, not a pool worker, and the port's ONLY reader. It sleeps in
+        // GetQueuedCompletionStatusEx, moves every completion into the injector (no wake -- every
+        // worker takes from it each pass, and the last hunter never parks), and goes straight back.
+        // It runs nothing itself, so it is never away from the port while completions arrive.
+        // Workers never touch the port: here every look is a kernel call. See kport_model.c.
+        //
+        // Not K: a pump needs no deque, inbox, hunt state or reserved slot, and counting it as K
+        // would cost a compute worker for a thread that is asleep nearly always.
+        std::thread pump;
+
+        // Key 0 is every registered handle; a packet with this key and no OVERLAPPED is the stop
+        // marker Stop() posts to end the pump.
+        static constexpr ULONG_PTR    kWakeKey   = 1;
+        static constexpr ULONG        kBatch     = 64;
 
         void Link(IoRequest* r) {
             Shard& s = ShardFor(r);
@@ -158,7 +172,7 @@ namespace JLib {
             r->next = s.head;
             if (s.head) s.head->prev = r;
             s.head = r;
-            total.fetch_add(1, std::memory_order_relaxed);
+            detail::g_ioOutstanding.fetch_add(1, std::memory_order_relaxed);
         }
 
         void Unlink(IoRequest* r) {
@@ -167,16 +181,7 @@ namespace JLib {
             else if (s.head == r) s.head = r->next;
             if (r->next) r->next->prev = r->prev;
             r->prev = r->next = nullptr;
-            total.fetch_sub(1, std::memory_order_relaxed);
-        }
-
-        void EnsureThreads() {
-            std::lock_guard<std::mutex> lk(life);
-            if (running) return;
-            running = true;
-            const unsigned n = TaskScheduler::IoCompletionThreads();
-            workers.reserve(n);
-            for (unsigned i = 0; i < n; ++i) workers.emplace_back([this] { Run(); });
+            detail::g_ioOutstanding.fetch_sub(1, std::memory_order_relaxed);
         }
 
         static IoResult Classify(BOOL ok, DWORD err, DWORD bytes) {
@@ -185,10 +190,10 @@ namespace JLib {
                 res.status = IoStatus::Completed;
                 res.bytes  = static_cast<std::uint32_t>(bytes);
             } else if (err == ERROR_OPERATION_ABORTED) {
-                
+
                 res.status = IoStatus::Cancelled;
             } else if (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE) {
-                
+
                 res.status = IoStatus::Completed;
                 res.bytes  = 0;
             } else {
@@ -198,142 +203,103 @@ namespace JLib {
             return res;
         }
 
-        static constexpr std::size_t kBatch = 32;
+        // One dequeued completion: publish the result and return the resume to run, or null if
+        // there is none or it was handed on (a pinned resume goes where its pin says).
+        Task* Complete(const OVERLAPPED_ENTRY& e) {
+            OVERLAPPED* ov = e.lpOverlapped;
+            IoRequest* r = reinterpret_cast<IoRequest*>(
+                reinterpret_cast<unsigned char*>(ov) - offsetof(IoRequest, native));
 
-        void Run() {
-            
-            Task* batchHi[kBatch]; std::size_t nHi = 0;
-            Task* batchLo[kBatch]; std::size_t nLo = 0;
 #if defined(JLIBSCHED_IO_LOCK_STATS)
-            IoResult* outHi[kBatch]; IoResult* outLo[kBatch];
+            if (const DWORD cpu = ::GetCurrentProcessorNumber(); cpu < 64)
+                detail::g_complCore[cpu].fetch_add(1, std::memory_order_relaxed);
+#endif
+            // GetQueuedCompletionStatusEx reports no per-entry error; the status is in the
+            // OVERLAPPED, and GetOverlappedResult (no wait) maps it the same way the single-packet
+            // GetQueuedCompletionStatus did.
+            DWORD bytes = e.dwNumberOfBytesTransferred;
+            const BOOL ok = ::GetOverlappedResult(static_cast<HANDLE>(r->handle), ov, &bytes, FALSE);
+            const IoResult res = Classify(ok, ok ? ERROR_SUCCESS : ::GetLastError(), bytes);
+
+            if (res.status == IoStatus::Completed && r->kind != IoRequest::Kind::Generic) {
+                if (r->kind == IoRequest::Kind::Accept) {
+
+                    const SOCKET listener = reinterpret_cast<SOCKET>(r->handle);
+                    const SOCKET accepted = static_cast<SOCKET>(r->aux);
+                    ::setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                                 reinterpret_cast<const char*>(&listener), sizeof listener);
+                } else if (r->kind == IoRequest::Kind::Connect) {
+                    // Only ConnectEx needs it. Send/Recv (IoStream chains) are non-Generic too,
+                    // and paid a wasted setsockopt on every completion.
+                    const SOCKET s = reinterpret_cast<SOCKET>(r->handle);
+                    ::setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+                }
+            }
+
+            Task* resume = nullptr;
+            {
+                std::lock_guard<IoMutex> lk(ShardFor(r).m);
+                Unlink(r);
+                if (r->out) *r->out = res;
+                resume = r->resume;
+            }
+
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+            if (r->out) r->out->completedAtNs = MonotonicNs();
 #endif
 
-            const auto Flush = [&](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
-                if (!TaskScheduler::IsInitialized()) { nh = 0; nl = 0; return; }
-#if defined(JLIBSCHED_IO_LOCK_STATS)
-                
-                const std::int64_t now = MonotonicNs();
-                for (std::size_t i = 0; i < nh; ++i) if (outHi[i]) outHi[i]->flushedAtNs = now;
-                for (std::size_t i = 0; i < nl; ++i) if (outLo[i]) outLo[i]->flushedAtNs = now;
-#endif
-                
-                const std::size_t hotN = TaskScheduler::GetHotWorkers();
-                // Latency completions go to the shared lane intake. Normal ones, and latency ones
-                // the intake refuses (off, or no K), are a batch for the compute workers.
-                auto pushSteered = [&](Task** arr, std::size_t n, Lane lane) {
-                    if (!n) return;
-                    auto& s = TaskScheduler::Instance();
+            if (r->onComplete) r->onComplete(r);   // may resubmit or free r: not touched after
 
-                    if (hotN != 0 && IsLowLatency(lane) && s.LaneIntakeEnabled()) {
-                        if (TaskScheduler::PushLaneIntake(arr, n)) {
-                            detail::g_ioToLane.fetch_add(n, std::memory_order_relaxed);
-                            return;
-                        }
-                        detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
-                    }
-                    detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed);
-                    // Each completion to a compute worker's hi-pri inbox, round-robin with a wake.
-                    // That inbox is checked every pass ahead of the worker's own deque, so a busy
-                    // worker takes it at its next task boundary. A normal inbox is drained only
-                    // when the deque runs dry or on the fairness tick: under load a completion
-                    // placed there waited behind the worker's own successors (measured ~3 ms vs
-                    // ~100 us here, 200 us tasks).
-                    for (std::size_t i = 0; i < n; ++i) s.PushTo(arr[i], CorePref::Any, true);
-                };
-                pushSteered(hi, nh, Lane::LowLatency);  nh = 0;
-                pushSteered(lo, nl, Lane::Normal); nl = 0;
-            };
+            if (resume && TaskScheduler::IsInitialized() && TaskScheduler::IsPinned(resume)) {
+                TaskScheduler::Instance().WakeTask(resume);
+                return nullptr;
+            }
+            return resume;
+        }
 
+        // A batch from the port, ALL of it to the injector in one bulk push (no wake: every worker
+        // reads the injector each pass). Pinned resumes never get here -- Complete() routes them
+        // through WakeTask. Returns the number of stop markers seen.
+        unsigned Dispatch(const OVERLAPPED_ENTRY* es, ULONG n) {
+            Task* ts[kBatch];
+            std::size_t nt = 0;
+            unsigned markers = 0;
+            for (ULONG i = 0; i < n; ++i) {
+                if (!es[i].lpOverlapped) {
+                    if (es[i].lpCompletionKey == kWakeKey) ++markers;
+                    continue;
+                }
+                if (Task* t = Complete(es[i])) ts[nt++] = t;
+            }
+            Inject(ts, nt);
+            return markers;
+        }
+
+        static void Inject(Task** ts, std::size_t n) {
+            if (!n || !TaskScheduler::IsInitialized()) return;
+            if (TaskScheduler::PushInjector(ts, n)) {
+                detail::g_ioToLane.fetch_add(n, std::memory_order_relaxed);
+                return;
+            }
+            // Injector refused (pool stopping): each to a compute worker, as before the injector.
+            detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
+            auto& s = TaskScheduler::Instance();
+            for (std::size_t i = 0; i < n; ++i) s.PushTo(ts[i], CorePref::Any, true);
+        }
+
+        // The pump's whole life: sleep in the port, inject, repeat -- until Stop() posts a marker.
+        // Above the compute workers, as the clock is: a descheduled pump delays every completion,
+        // and it is asleep nearly always, so it costs nothing to run first when it does wake.
+        void Pump() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             for (;;) {
-                DWORD bytes = 0;
-                ULONG_PTR key = 0;
-                LPOVERLAPPED ov = nullptr;
-
-                const BOOL ok = (nHi == 0 && nLo == 0)
-                    ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)
-                    : GetQueuedCompletionStatus(port, &bytes, &key, &ov, 0);
-
-#if defined(JLIBSCHED_IO_LOCK_STATS)
-                
-                if (const DWORD cpu = ::GetCurrentProcessorNumber(); cpu < 64)
-                    detail::g_complCore[cpu].fetch_add(1, std::memory_order_relaxed);
-#endif
-
-                if ((nHi || nLo) && ov == nullptr && !ok) {
-                    Flush(batchHi, nHi, batchLo, nLo);
+                OVERLAPPED_ENTRY es[kBatch];
+                ULONG n = 0;
+                if (!::GetQueuedCompletionStatusEx(port, es, kBatch, &n, INFINITE, FALSE)) {
+                    if (stopping.load(std::memory_order_acquire)) return;   // never spin on a dead port
                     continue;
                 }
-
-                if (ov == nullptr) {
-                    
-                    if (!ok) {
-                        if (::GetLastError() == WAIT_TIMEOUT) continue;
-                        return;
-                    }
-                    if (stopping.load(std::memory_order_acquire) && total.load(std::memory_order_acquire) == 0) {
-                        
-                        ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
-                        return;
-                    }
-                    continue;
-                }
-
-                IoRequest* r = reinterpret_cast<IoRequest*>(
-                    reinterpret_cast<unsigned char*>(ov) - offsetof(IoRequest, native));
-                const IoResult res = Classify(ok, ok ? ERROR_SUCCESS : ::GetLastError(), bytes);
-
-                if (res.status == IoStatus::Completed && r->kind != IoRequest::Kind::Generic) {
-                    if (r->kind == IoRequest::Kind::Accept) {
-                        
-                        const SOCKET listener = reinterpret_cast<SOCKET>(r->handle);
-                        const SOCKET accepted = static_cast<SOCKET>(r->aux);
-                        ::setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                                     reinterpret_cast<const char*>(&listener), sizeof listener);
-                    } else {
-                        const SOCKET s = reinterpret_cast<SOCKET>(r->handle);
-                        ::setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
-                    }
-                }
-
-                Task* resume = nullptr;
-                bool  lastOne = false;
-                {
-                    std::lock_guard<IoMutex> lk(ShardFor(r).m);
-                    Unlink(r);                     
-                    if (r->out) *r->out = res;     
-                    resume = r->resume;
-                    lastOne = false;
-                }
-
-#if defined(JLIBSCHED_IO_LOCK_STATS)
-                
-                if (r->out) r->out->completedAtNs = MonotonicNs();
-#endif
-
-                if (r->onComplete) r->onComplete(r);
-
-#if defined(JLIBSCHED_COROUTINES)
-                // Coroutine I/O: resume is the suspended coroutine itself, not a fresh fiber job.
-                if (resume && TaskScheduler::IsInitialized() && TaskScheduler::IsPinned(resume)) {
-                    TaskScheduler::Instance().WakeTask(resume);
-                    resume = nullptr;
-                }
-#endif
-                if (resume) {
-#if defined(JLIBSCHED_IO_LOCK_STATS)
-                    if (IsLowLatency(resume->lane)) outHi[nHi] = r->out; else outLo[nLo] = r->out;
-#endif
-                    if (IsLowLatency(resume->lane)) batchHi[nHi++] = resume;
-                    else               batchLo[nLo++] = resume;
-                    if (nHi == kBatch || nLo == kBatch) Flush(batchHi, nHi, batchLo, nLo);
-                }
-
-                if (lastOne || ((nHi || nLo) && stopping.load(std::memory_order_acquire)))
-                    Flush(batchHi, nHi, batchLo, nLo);
-                if (lastOne) {
-                    ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
-                    return;
-                }
+                if (Dispatch(es, n) != 0 && stopping.load(std::memory_order_acquire)) return;
             }
         }
 
@@ -355,15 +321,11 @@ namespace JLib {
             req->token  = tok;
             req->handle = h;
 
-            if (resume && resume->type == TaskType::Fiber && resume->stackClass == StackClass::Standard)
-                resume->stackClass = StackClass::Tiny;
-
             {
                 if (stopping.load(std::memory_order_acquire)) {
                     if (out) *out = IoResult{ IoStatus::Failed, 0, ERROR_SHUTDOWN_IN_PROGRESS };
                     return true;
                 }
-                EnsureThreads();
                 std::lock_guard<IoMutex> lk(ShardFor(req).m);
                 
                 Link(req);
@@ -385,9 +347,10 @@ namespace JLib {
     };
 
     IoReactor::IoReactor() : impl(new Impl()) {
-        
-        impl->port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0,
-                                              TaskScheduler::IoCompletionThreads());
+        // Only the pump ever waits on this port, so the concurrency value never binds. It is set
+        // far above any pool so it can never be what holds the pump back with packets queued.
+        constexpr DWORD kNoThrottle = 4096;
+        impl->port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, kNoThrottle);
     }
 
     IoReactor::~IoReactor() {
@@ -404,21 +367,20 @@ namespace JLib {
 
     bool IoReactor::IsAvailable() noexcept { return true; }
 
-    static bool IoLayerUsable() {
-        if (!TaskScheduler::IsInitialized() || TaskScheduler::IoReactorEnabled()) return true;
+    // I/O is opt-in: until Start() there is no pump, so nothing may be registered or set up. Say
+    // so, instead of failing quietly. "Not started" is exactly `stopping` (it starts true).
+    static bool IoStarted(const IoReactor::Impl* impl) {
+        if (!impl->stopping.load(std::memory_order_acquire)) return true;
         std::fprintf(stderr,
-            "[JLib::Scheduler] IoReactor used but the I/O layer is not enabled -- the pool was sized "
-            "without a core for its completion thread. Set Config::io = true at Init.\n");
+            "[JLib::Scheduler] IoReactor used before IoReactor::Instance().Start() -- I/O is "
+            "opt-in; start it after TaskScheduler::Init.\n");
         return false;
     }
 
     bool IoReactor::Register(void* handle) {
-        if (!IoLayerUsable()) return false;
+        if (!IoStarted(impl)) return false;
         if (!handle || handle == INVALID_HANDLE_VALUE || !impl->port) return false;
-        {
-            if (impl->stopping.load(std::memory_order_acquire)) return false;
-            impl->EnsureThreads();
-        }
+        if (impl->stopping.load(std::memory_order_acquire)) return false;
         
         return ::CreateIoCompletionPort(static_cast<HANDLE>(handle), impl->port, 0, 0) != nullptr;
     }
@@ -440,7 +402,7 @@ namespace JLib {
         });
     }
 
-    bool IoReactor::InitSockets() { return IoLayerUsable() && ResolveExtensions(); }
+    bool IoReactor::InitSockets() { return IoStarted(impl) && ResolveExtensions(); }
 
     bool IoReactor::RegisterSocket(IoSocket s) {
         
@@ -645,34 +607,62 @@ namespace JLib {
     }
 
     std::size_t IoReactor::InFlight() const noexcept {
-        return impl->total.load(std::memory_order_acquire);
+        return detail::g_ioOutstanding.load(std::memory_order_acquire);
     }
 
+    namespace {
+        void StartIoHook() { IoReactor::Instance().Start(); }
+        void StopIoHook()  { IoReactor::Instance().Stop(); }
+    }
+
+    // THE OPT-IN. Nothing I/O exists until this runs: it starts the pump and registers the stop
+    // hook Join calls. Before or after Init: before, it only leaves a start hook and Init starts
+    // the pump once the pool can take completions (see detail::g_ioStartHook).
     void IoReactor::Start() noexcept {
+        if (!TaskScheduler::IsInitialized()) {
+            detail::g_ioStartHook.store(&StartIoHook, std::memory_order_release);
+            return;
+        }
         std::lock_guard<std::mutex> lk(impl->life);
         impl->stopping.store(false, std::memory_order_release);
+        if (!impl->pump.joinable()) impl->pump = std::thread([p = impl] { p->Pump(); });
+        detail::g_ioStopHook.store(&StopIoHook, std::memory_order_release);
     }
 
+    // Called from Join (through the hook) while the pool still runs. Cancels everything in flight
+    // and lets the pump drain the port -- it stays the port's only reader to the end -- so every
+    // resume is handed to the pool before it stops. A request that ignores its cancel would hold
+    // this forever, so the wait gives up after a bounded spell with no progress. Then the stop
+    // marker ends the pump.
     void IoReactor::Stop() noexcept {
-        bool needJoin = false;
         {
             std::lock_guard<std::mutex> lk(impl->life);
             if (impl->stopping.load(std::memory_order_acquire)) return;
             impl->stopping.store(true, std::memory_order_release);
-            needJoin = impl->running;
         }
+        detail::g_ioStopHook.store(nullptr, std::memory_order_release);
 
         RequestCancel(CancelToken{});
 
-        if (needJoin) {
-            std::vector<std::thread> ts;
-            { std::lock_guard<std::mutex> lk(impl->life); ts.swap(impl->workers); }
-            
-            for (std::size_t i = 0; i < ts.size(); ++i)
-                ::PostQueuedCompletionStatus(impl->port, 0, 0, nullptr);
-            for (auto& t : ts) if (t.joinable()) t.join();
+        int quietMs = 0;
+        std::size_t last = detail::g_ioOutstanding.load(std::memory_order_acquire);
+        while (last != 0 && quietMs < 2000) {
+            ::Sleep(10);
+            const std::size_t now = detail::g_ioOutstanding.load(std::memory_order_acquire);
+            quietMs = (now == last) ? quietMs + 10 : 0;   // quiet = no completion in the step
+            last = now;
         }
-        impl->running = false;
+
+        // `stopping` is already set, so the pump returns on this marker (and never before it:
+        // nothing else posts one).
+        if (impl->pump.joinable()) {
+            ::PostQueuedCompletionStatus(impl->port, 0, Impl::kWakeKey, nullptr);
+            impl->pump.join();
+        }
+        if (const std::size_t left = detail::g_ioOutstanding.load(std::memory_order_acquire)) {
+            std::fprintf(stderr, "[JLib::Scheduler] I/O stop: %zu request(s) still outstanding after "
+                                 "cancel; their resumes will not run.\n", left);
+        }
     }
 
-} 
+}

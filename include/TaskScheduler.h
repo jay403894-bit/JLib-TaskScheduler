@@ -2,7 +2,12 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #pragma once
+// Guarded: most Windows consumers already define this on the command line, and an unguarded
+// redefinition is a C4005 in every translation unit that includes us. platform.h guards it the
+// same way.
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include "Task.h"
 #include "Stats.h"
 #include "CancelToken.h"
@@ -39,6 +44,19 @@ namespace JLib {
 
 	namespace detail {
 		inline void RecordTaskSize(size_t n) { JLIB_STAT_HIST(TaskBytes, n); (void)n; }
+
+		// I/O is OPT-IN: nothing I/O exists until the program calls IoReactor::Instance().Start(),
+		// before or after Init. Both hooks are pointers rather than calls so the core names nothing
+		// in the I/O layer -- a program that never starts I/O never links the reactor, or Winsock.
+		//
+		// Start hook: a Start() BEFORE Init leaves this set instead of starting (the pump's
+		// completions go to the pool, which does not exist yet). Init runs it once, after StartPool
+		// returns -- the instance exists, the workers run and poolActive is set -- so the order the
+		// program calls them in does not matter.
+		extern std::atomic<void (*)()> g_ioStartHook;
+		// Stop hook: set by a Start() that actually started the pump. Join calls it before the pool
+		// stops, so completions still in the port reach the pool.
+		extern std::atomic<void (*)()> g_ioStopHook;
 	}
 
 	enum class WaitResult : uint8_t {
@@ -245,9 +263,9 @@ namespace JLib {
 		static void     GetReservedStealStats(uint64_t& steals, uint64_t& returned) noexcept;
 		static bool     IoLaneQuiet() noexcept;
 
-		static bool  PushLaneIntake(Task** tasks, size_t n) noexcept;
-		static Task* TakeLaneIntake() noexcept;
-		static bool  LaneIntakeIdle() noexcept;
+		static bool  PushInjector(Task** tasks, size_t n) noexcept;
+		static Task* TakeInjector() noexcept;
+		static bool  InjectorIdle() noexcept;
 
 		// Every kFairTickEvery-th pass a compute worker drains its inbox even when its own deque is
 		// not empty (normally the inbox waits for the deque to run dry), so a worker whose work keeps
@@ -272,8 +290,8 @@ namespace JLib {
 		static bool IsPinned(const Task* t) {
 			return t->record && t->record->pinTo != TaskRecord::kNoPin;
 		}
-		// The only way a TaskType::Main task is ever queued. Main in the pool: PushTo(0). Main out
-		// of the pool: mainQ push + kick main.
+		// Queues a task for main: PushMain's placement, and a Pin::Main resume. Main in the pool:
+		// PushTo(0). Main out of the pool: mainQ push + kick main.
 		void PushMainQueue(Task* task);
 		// Runs one task taken from mainQ: a fresh body, or a Pin::Main resume switched into.
 		void RunMainTask(Task* task);
@@ -287,7 +305,7 @@ namespace JLib {
 		//   Narrow: the whole batch into ONE worker's inbox with one wake; that worker moves it into
 		//           its own deque as it goes, where the rest of the pool can steal it.
 		// A batch has no lane: it is a run for a compute worker to load onto its own deque. Latency
-		// work goes to the shared lane intake (PushLaneIntake), never as a batch.
+		// work goes to the shared injector (PushInjector), never as a batch.
 		enum class BatchSpread : uint8_t { Wide, Narrow };
 		void PushBatch(Task* tasks[], size_t count, BatchSpread spread);
 
@@ -323,8 +341,8 @@ namespace JLib {
 				wg->n.fetch_add((int)ts.size(), std::memory_order_relaxed);
 			if (!ts.empty()) {
 				// Latency chunks go to the shared intake; refused (off, or no K), they are a batch.
-				if (!(IsLowLatency(lane) && HiPriLaneActive() && LaneIntakeEnabled()
-				      && PushLaneIntake(ts.data(), ts.size())))
+				if (!(IsLowLatency(lane) && HiPriLaneActive() && InjectorEnabled()
+				      && PushInjector(ts.data(), ts.size())))
 					PushBatch(ts.data(), ts.size(), kAnyWorker, 64);
 			}
 			return ts.size();
@@ -335,8 +353,12 @@ namespace JLib {
 		}
 
 		size_t GetWorkerCount() const;
+		// Every worker's Thread, indexed by worker (qIndex); empty with no pool. Read-only and fixed
+		// from Init to Join. For COLLECTING per-worker state (Thread::PeekLocal) -- a task reaches its
+		// own worker through task->record->home and never needs this. Read another worker's state
+		// only when it is atomic or after the work that wrote it has been joined.
+		static const std::vector<Thread*>& GetWorkers() noexcept;
 
-		const std::vector<Thread*>& GetThreads() const { return workers; }
 
 		void PrefaultTaskSlots(size_t slots);
 
@@ -351,7 +373,6 @@ namespace JLib {
 
 		struct FiberBudget {
 			size_t normalPerComputeWorker = 64;
-			size_t tinyPerKWorker         = 64;
 			size_t deepPerComputeWorker   = 1;
 		};
 
@@ -377,7 +398,7 @@ namespace JLib {
 			bool     parallelForSerial = false;
 			unsigned ioQuietWindowUs   = 500;
 			bool     reservedStealing  = true;
-			bool     laneIntake        = true;
+			bool     injector        = true;
 			bool     bareWaitHelp      = false;
 			int      fastSpinTries     = -1;   // -1 = the build's JLIBSCHED_FAST_SPIN_TRIES
 		};
@@ -397,8 +418,8 @@ namespace JLib {
 			PowerThrottling power     = PowerThrottling::OptOut;
 			unsigned        reservedCores = 0;
 			bool            timers    = false;      // also reserves a core
-			bool            io        = false;      // implies timers
-			unsigned        ioCompletionThreads = 1;
+			// No `io` switch: I/O is opted into by starting it -- IoReactor::Instance().Start(),
+			// before or after Init.
 			FiberBudget     fibers;
 			size_t          fiberMemoryLimit = size_t(1) << 30;   // 0 = no limit
 			SlabSizes       slab;
@@ -407,6 +428,20 @@ namespace JLib {
 			// Epoch slots for threads outside the pool (ThreadScope), reserved at Init. Only
 			// claimed slots cost anything: an idle one never holds back reclamation.
 			size_t          externalThreads = 16;
+			// The pool's heap (Memory.h). arenaReserveBytes > 0 reserves an exclusive arena for it at
+			// Init -- memory reserved once instead of asked of the OS on the fly; arenaCommit also
+			// commits it. Reserved once per process and reused by later pools. 0 = no reservation.
+			size_t          arenaReserveBytes = 0;
+			bool            arenaCommit       = false;
+			// MainMode::InPool only: main's OS message pump, supplied by the app (PeekMessage loop,
+			// SDL_PumpEvents, glfwPollEvents). Main calls it while it helps (every pumpMainEvery
+			// passes) and before it sleeps, so a window it owns keeps answering during long waits.
+			// The library never owns a window. budgetUs is the app's to honour: it cannot be enforced
+			// from here. Null = no pump, main behaves as before. Ignored out of the pool, where main
+			// is the app's own message thread.
+			void          (*pumpMain)(std::uint32_t budgetUs) = nullptr;
+			std::uint32_t   pumpMainBudgetUs = 1000;
+			std::uint32_t   pumpMainEvery    = 64;
 			Tunables        tunables;
 		};
 
@@ -439,8 +474,8 @@ namespace JLib {
 		unsigned IoQuietWindowUs() const noexcept;
 		void     SetReservedStealing(bool on) noexcept;
 		bool     ReservedStealing() const noexcept;
-		void     SetLaneIntake(bool on) noexcept;
-		bool     LaneIntakeEnabled() const noexcept;
+		void     SetInjector(bool on) noexcept;
+		bool     InjectorEnabled() const noexcept;
 		void     SetBareWaitHelp(bool on) noexcept;
 		bool     BareWaitHelp() const noexcept;
 #if defined(JLIBSCHED_TUNABLE_FAST_SPIN)
@@ -454,9 +489,6 @@ namespace JLib {
 
 		static bool TimersEnabled() noexcept;
 
-		static bool IoReactorEnabled() noexcept;
-		static unsigned IoCompletionThreads() noexcept;
-
 		static bool ReserveTimerCore() noexcept;
 
 		static std::string SlabUsageString(const char* label = "slab usage");
@@ -468,30 +500,17 @@ namespace JLib {
 		static std::uint64_t OutstandingFiberRows() noexcept;
 
 		static unsigned GetReservedCores() noexcept;
-		static bool ReserveIoCore() noexcept;
 
 		static size_t NormalFibersPerComputeWorker();
-		static size_t TinyFibersPerKWorker();
 		static size_t DeepFibersPerComputeWorker();
 		// Fibers are made in blocks as tasks need them; the budget is the first block. Growth stops
 		// at Config::fiberMemoryLimit bytes of fiber stack across all classes.
 		static size_t FiberMemoryLimit();
 
 
-		static uint16_t AllocFiberLocalSlot() noexcept;
-
-
-		static bool   HasFiberLocal() noexcept;
-		static void*& FiberLocal(size_t slot) noexcept;
-
-		template <typename T>
-		static T* FiberLocalAs(size_t slot) noexcept {
-			return static_cast<T*>(FiberLocal(slot));
-		}
-
 		// Cleanup owed at task death, released by whoever frees the record. There is no
 		// holder-specific form: a dead record does not hop from worker to worker any more.
-		static bool ReleaseOnFiberDeath(FiberDebt& node, void* obj,
+		static bool ReleaseOnTaskDeath(TaskDebt& node, void* obj,
 		                                void (*release)(void*) noexcept) noexcept;
 
 		// The record of the task running on this thread (fiber or not), or null.
@@ -502,9 +521,9 @@ namespace JLib {
 		void               ReleaseRecord(TaskRecord* r) noexcept;
 
 		template <typename T>
-		static bool DeleteOnFiberDeath(FiberDebt& node, T* p) noexcept {
+		static bool DeleteOnTaskDeath(TaskDebt& node, T* p) noexcept {
 			if (!p) return false;
-			return ReleaseOnFiberDeath(node, p,
+			return ReleaseOnTaskDeath(node, p,
 				[](void* q) noexcept { delete static_cast<T*>(q); });
 		}
 
@@ -542,18 +561,20 @@ namespace JLib {
 		TaskRecord* NewTaskRecord();
 		void        FreeTask(Task* t);
 
-		Task* CreateTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber,
+		// The default is Native: fn(data) is called on the worker's own stack with no fiber checked
+		// out, and must not suspend. Most tasks never suspend, so that is what you want unless you
+		// say otherwise -- pass TaskType::Fiber for a task that waits.
+		Task* CreateTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal, TaskType type = TaskType::Native,
 		                 StackClass stack = StackClass::Standard) {
 			return CreateTaskImpl(fn, data, lane, type, stack);
 		}
 
-		// A native task: fn(data) is called on the worker's own stack, no fiber is checked out. It
-		// must not suspend (WaitFor, SchedulerMutex, ... are fatal inside it); it may block the OS
-		// thread only inside BlockInPlace, which hands its inbox to another thread meanwhile.
+		// Spelled-out form of the default above, kept because it names the contract at the call
+		// site: it must not suspend (WaitFor, SchedulerMutex, ... are fatal inside it); it may block
+		// the OS thread only inside BlockInPlace, which unloads its inbox onto its own deque (so the
+		// work becomes stealable) and marks the thread away, leaving the pool to run on N-1.
 		Task* CreateNativeTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal) {
-			Task* t = CreateTaskImpl(fn, data, lane, TaskType::Fiber);
-			if (t) t->native = 1;
-			return t;
+			return CreateTaskImpl(fn, data, lane, TaskType::Native);
 		}
 
 		Task* CreateInternalTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal,
@@ -563,7 +584,9 @@ namespace JLib {
 
 		template<typename F>
 		auto CreateTask(F&& f, Lane lane = Lane::Normal, StackClass stack = StackClass::Standard) {
-			constexpr TaskType type = TaskType::Fiber;   // may run on a fiber, must not suspend (native)
+			// LambdaTask's constructor already sets this; restated here because the line below
+			// writes the whole flag field and a lambda is Native by construction either way.
+			constexpr TaskType type = TaskType::Native;
 			using L = LambdaTask<std::decay_t<F>>;
 			
 			detail::RecordTaskSize(sizeof(L));
@@ -658,11 +681,11 @@ namespace JLib {
 		size_t LaneIndexForCurrentThread();
 		std::vector<std::unique_ptr<TaskMPSCQueue>> normalInboxes;
 		
-		moodycamel::ConcurrentQueue<Task*> laneIntake;
-		// Tasks in laneIntake, kept beside it so the per-pass "anything there?" check is one load of
+		moodycamel::ConcurrentQueue<Task*> injector;
+		// Tasks in injector, kept beside it so the per-pass "anything there?" check is one load of
 		// a line written only when latency work arrives or leaves. Signed: a taker can decrement
 		// before the pusher's increment lands, which reads as "nothing yet" for an instant.
-		alignas(platform::kCacheLine) std::atomic<long long> laneIntakeCount_{ 0 };
+		alignas(platform::kCacheLine) std::atomic<long long> injectorCount_{ 0 };
 
 		// Direct-run inboxes: popped and run by their owner only, never moved to a deque, never
 		// stolen. Hi-pri lane work and pinned resumes both land here.
@@ -720,7 +743,7 @@ namespace JLib {
 			std::atomic<bool>     seekOnMiss;
 			std::atomic<unsigned> ioQuietWindowUs;
 			std::atomic<bool>     reservedStealing;
-			std::atomic<bool>     laneIntake;
+			std::atomic<bool>     injector;
 			std::atomic<bool>     bareWaitHelp;
 			std::atomic<int>      fastSpinTries;
 			explicit LiveTunables(const Tunables& t) noexcept;

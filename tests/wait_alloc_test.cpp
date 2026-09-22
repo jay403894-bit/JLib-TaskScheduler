@@ -1,4 +1,4 @@
-// Counts heap allocations while fibers and coroutines suspend on SchedulerMutex,
+﻿// Counts heap allocations while fibers and coroutines suspend on SchedulerMutex,
 // SchedulerSemaphore and the CV. The queue used to be std::queue<Waiter>, so every empty ->
 // non-empty transition allocated a deque chunk, inside the primitive's spinlock. With the node on
 // the waiter's own stack, the count must not depend on how many waits happen.
@@ -91,7 +91,7 @@ static void RunFiberPhase(void (*fn)(void*), int tasks, long per) {
 	WaitGroup wg;
 	wg.n.fetch_add(tasks);
 	for (int i = 0; i < tasks; ++i) {
-		Task* t = s.CreateTask(fn, (void*)(intptr_t)per);
+		Task* t = s.CreateTask(fn, (void*)(intptr_t)per, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &wg;
 		s.Push(t);
 	}
@@ -169,7 +169,7 @@ int main() {
 		WaitGroup wg;
 		wg.n.fetch_add(kTasks);
 		for (int i = 0; i < kTasks; ++i) {
-			Task* t = s.CreateTask(&CvTask, nullptr);
+			Task* t = s.CreateTask(&CvTask, nullptr, Lane::Normal, TaskType::Fiber);
 			t->waitGroup = &wg;
 			s.Push(t);
 		}

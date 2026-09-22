@@ -49,8 +49,8 @@ int main() {
 
 		s.SetWakeCostNs(9999);
 		s.SetParallelForSerial(true);
-		s.SetLaneIntake(false);
-		Check(s.GetWakeCostNs() == 9999 && s.ParallelForSerial() && !s.LaneIntakeEnabled(),
+		s.SetInjector(false);
+		Check(s.GetWakeCostNs() == 9999 && s.ParallelForSerial() && !s.InjectorEnabled(),
 		      "tunables change while the pool runs");
 		Check(RunSome(s), "the pool runs work");
 		detail::DestroyForTesting();
@@ -69,7 +69,7 @@ int main() {
 		Check(s.GetLeavesPerWorker() == def.tunables.leavesPerWorker, "leaves per worker is back to the default");
 		Check(s.GetWakeCostNs() == def.tunables.wakeCostNs, "wake cost did not carry over");
 		Check(!s.ParallelForSerial(), "pfor-serial did not carry over");
-		Check(s.LaneIntakeEnabled(), "lane intake did not carry over");
+		Check(s.InjectorEnabled(), "lane intake did not carry over");
 		Check(RunSome(s), "the second pool runs work");
 	}
 

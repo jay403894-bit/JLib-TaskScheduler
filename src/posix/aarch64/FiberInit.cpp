@@ -13,32 +13,3 @@ using namespace JLib;
 
 extern "C" void FiberTrampoline();
 
-void Fiber::Init(void(*entryPoint)())
-{
-	
-	uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
-	uintptr_t* sp = (uintptr_t*)top;
-
-	*(--sp) = (uintptr_t)&FiberTrampoline;
-	*(--sp) = 0;                     
-
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = 0;                     
-	*(--sp) = (uintptr_t)entryPoint; 
-
-	*(--sp) = 0;
-
-	*(--sp) = 0;
-
-	for (int i = 0; i < 8; ++i)
-		*(--sp) = 0;
-
-	ctx.rsp = (void*)sp;
-}

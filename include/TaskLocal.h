@@ -30,8 +30,14 @@ namespace JLib {
 	// Called on the value in `slot` when a task dies, if one is set.
 	void SetTaskLocalDeleter(size_t slot, TaskLocalDeleter fn) noexcept;
 
-	// Debts left by a dead record (ReleaseOnFiberDeath) are released by a pool task.
+	// Debts left by a dead record (ReleaseOnTaskDeath) are released by a pool task.
 	void QueueDebtRelease();
+
+	namespace detail {
+		// Called by ReleaseRecord with the dying record's whole debt list.
+		void HandOffTaskDebts(TaskDebt* head) noexcept;
+	}
+
 
 	template <typename T>
 	struct TaskLocal {
@@ -42,13 +48,10 @@ namespace JLib {
 		T*   operator->() const noexcept { return get(); }
 		explicit operator bool() const noexcept { return get() != nullptr; }
 	};
-	template <typename T> using FiberLocal = TaskLocal<T>;   // the old name
 
 	template <typename T>
 	inline TaskLocal<T> MakeTaskLocal() noexcept {
 		return TaskLocal<T>{ AllocTaskLocalSlot() };
 	}
-	template <typename T>
-	inline TaskLocal<T> MakeFiberLocal() noexcept { return MakeTaskLocal<T>(); }
 
 }

@@ -387,6 +387,8 @@ namespace JLib {
         std::atomic<std::uint64_t> g_ioToLane{ 0 };
         std::atomic<std::uint64_t> g_ioToFloor{ 0 };
         std::atomic<std::uint64_t> g_ioFloorFallback{ 0 };
+
+        std::atomic<std::size_t>  g_ioOutstanding{ 0 };
     }
 
     IoRoutingStats ReadIoRoutingStats() noexcept {

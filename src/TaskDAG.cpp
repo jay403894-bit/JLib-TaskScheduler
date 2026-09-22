@@ -6,7 +6,8 @@
 #include <cstdio>    
 #include <cstdlib>
 #include <new>
-#include "../include/Reclaimer.h"   
+#include "../include/Reclaimer.h"
+#include "../include/Memory.h"   
 using namespace JLib;
 
 void TaskDAG::RejectIfSubmitted(const char* what) const {
@@ -41,8 +42,10 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
 }
 
 TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
-    // Fire() hands main nodes to PushMain, which retags them TaskType::Main. With main out of the pool it has
-    // no fibers, so a main node must not suspend there (the suspend points fail loudly if it does).
+    // Fire() hands main nodes to PushMain, which starts them on main and keeps their type: a Native node
+    // runs straight on main's stack, a Fiber node gets a fiber. A Fiber node that suspends resumes where
+    // its wait's pin says (Pin::Main to finish on main). With main out of the pool it has no fibers, so a
+    // main node must not suspend there (the suspend points fail loudly if it does).
     TaskNode* node = CreateNode(t, priority, NONE);
     if (node) node->isMain = true;
     return node;
@@ -212,8 +215,16 @@ JLib::DagEdge* JLib::TaskDAG::AllocEdge() {
 
         // Full (or none yet): take a block and chain it for retirement before anyone can use it,
         // so ~TaskDAG frees it even if this thread never installs it below.
+        // From the calling worker's own heap (Memory.h); any thread may free it later.
+        // JLIB_DAG_CTL_EDGE_NEW: the previous general-heap new/delete, for A/B only.
+#if defined(JLIB_DAG_CTL_EDGE_NEW)
         EdgeBlock* fresh = new (std::nothrow) EdgeBlock();
         if (!fresh) return nullptr;
+#else
+        void* mem = JLib::Alloc(sizeof(EdgeBlock));
+        if (!mem) return nullptr;
+        EdgeBlock* fresh = ::new (mem) EdgeBlock();
+#endif
         fresh->used.store(1, std::memory_order_relaxed);   // edges[0] is ours
 
         EdgeBlock* head = retireHead.load(std::memory_order_relaxed);
@@ -257,7 +268,14 @@ JLib::TaskDAG::~TaskDAG() {
 }
 
 void TaskDAG::EdgeBlockDeleter(void* p) {
-    delete static_cast<EdgeBlock*>(p);   // heap, not the slab: safe after the pool is gone
+    // Heap, not the slab: safe after the pool is gone (Join moves live blocks to mimalloc's main heap).
+#if defined(JLIB_DAG_CTL_EDGE_NEW)
+    delete static_cast<EdgeBlock*>(p);
+#else
+    EdgeBlock* b = static_cast<EdgeBlock*>(p);
+    b->~EdgeBlock();
+    JLib::Free(b);
+#endif
 }
 
 void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {

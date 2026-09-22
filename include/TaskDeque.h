@@ -15,9 +15,11 @@
 
 namespace JLib {
 
+    // What a thief can learn about a task from the deque slot alone, without dereferencing it.
+    // One field: the steal tag holds the TaskType and nothing else.
     struct StealBits {
         TaskType type;
-        bool     native;   // a native task (fn+ctx or lambda): runs on the worker stack, never suspends
+        bool native() const noexcept { return type == TaskType::Native; }
     };
 
     class alignas(platform::kCacheLine) TaskDeque {
@@ -176,23 +178,21 @@ namespace JLib {
         static_assert(alignof(Task) > kTagMask,
             "TaskDeque packs steal-vetting bits into the low bits of a Task*; Task's alignment "
             "must leave them free. Shrinking alignas(Task) breaks this silently.");
-        static_assert(static_cast<unsigned>(TaskType::Fiber) <= 3,
-            "TaskType must fit in the deque's two tag bits (2-3); adding a fifth value needs a "
-            "wider tag, and alignof(Task) is what limits how wide it can get.");
+        // Every TaskType value must fit in the two tag bits. Assert the LARGEST one: asserting a
+        // smaller member (Fiber is 0) checks nothing and would not catch a fifth value being added.
+        static_assert(static_cast<unsigned>(TaskType::Native) <= 3,
+            "TaskType must fit in the deque's two tag bits; adding a fifth value needs a wider "
+            "tag, and alignof(Task) is what limits how wide it can get.");
 
         static uintptr_t tag(Task* item) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(item);
-            // Type code 3 (unused by TaskType) marks a native task (lambda or CreateNativeTask).
-            const uintptr_t code = item->native ? 3u : (static_cast<uintptr_t>(item->type) & 0x3);
-            return p | code;
+            return p | (static_cast<uintptr_t>(item->type) & 0x3);
         }
         static Task* untag(uintptr_t v) {
             return reinterpret_cast<Task*>(v & ~kTagMask);
         }
         static StealBits bits(uintptr_t v) {
-            const unsigned code = (unsigned)(v & 0x3);
-            return StealBits{ code == 3 ? TaskType::Fiber : static_cast<TaskType>(code),
-                              code == 3 };
+            return StealBits{ static_cast<TaskType>((unsigned)(v & 0x3)) };
         }
 
         bool push_bottom(Task* item) {

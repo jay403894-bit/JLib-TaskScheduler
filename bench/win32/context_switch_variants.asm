@@ -33,7 +33,7 @@ kOnesPs dd  8 dup(3F800000h)
 .code
 
 ; ---- the shipped sequence, parameterised by the 16-byte move ---------------------------------
-CS_BODY MACRO mov16:REQ
+CS_BODY MACRO mov16:REQ, teb:=<1>
     ; 1. Callee-saved GPRs.
     push rbx
     push rbp
@@ -43,6 +43,22 @@ CS_BODY MACRO mov16:REQ
     push r13
     push r14
     push r15
+
+    ; 1b. TEB stack bounds (StackBase, StackLimit, DeallocationStack + 8 pad), as shipped. Fiber::Init
+    ;     seeds this block, so every arm must carry it or the first switch into the fiber loads garbage.
+    ;     teb=0 keeps the 32-byte slot (the frame layout must match Fiber::Init) but touches no TEB:
+    ;     the no-TEB arm, whose difference from the shipped one is exactly the six gs: accesses.
+    IF teb
+    mov rax, qword ptr gs:[8]
+    push rax
+    mov rax, qword ptr gs:[10h]
+    push rax
+    mov rax, qword ptr gs:[1478h]
+    push rax
+    sub rsp, 8
+    ELSE
+    sub rsp, 32
+    ENDIF
 
     ; 2. Non-volatile XMM6-15. 168 = 160 (10*16) + 8 realignment; the alignment argument is spelled
     ;    out in src/win32/ContextSwitch.asm and is unchanged here.
@@ -81,6 +97,19 @@ CS_BODY MACRO mov16:REQ
     mov16 xmm15, xmmword ptr [rsp + 144]
     add rsp, 168
 
+    ; 4b. The incoming context's TEB stack bounds.
+    IF teb
+    add rsp, 8
+    pop rax
+    mov qword ptr gs:[1478h], rax
+    pop rax
+    mov qword ptr gs:[10h], rax
+    pop rax
+    mov qword ptr gs:[8], rax
+    ELSE
+    add rsp, 32
+    ENDIF
+
     ; 5. Callee-saved GPRs back.
     pop r15
     pop r14
@@ -100,6 +129,12 @@ ENDM
 CsSse PROC
     CS_BODY movdqa
 CsSse ENDP
+
+; ARM A0 -- ARM A without the TEB stack-bound swap (same frame layout). ARM A minus this is what the
+; swap costs per switch.
+CsSseNoTeb PROC
+    CS_BODY movdqa, 0
+CsSseNoTeb ENDP
 
 ; ARM B -- one vzeroupper on entry, then the identical legacy-SSE body.
 ; Legal because the upper halves of YMM are VOLATILE across a call under the Win64 ABI: a context

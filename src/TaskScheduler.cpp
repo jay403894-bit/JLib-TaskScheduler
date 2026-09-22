@@ -8,9 +8,11 @@
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   
 #include "../include/TaskLocal.h"   
+#include "../include/Memory.h"
 
-#include "../include/IoReactor.h" 
-#include "../include/Reclaimer.h"  
+// No IoReactor.h here, on purpose: the core must name nothing in the I/O layer (see
+// detail::g_ioStopHook), or every program would link the reactor whether it uses I/O or not.
+#include "../include/Reclaimer.h"
 #include <cstdlib>            
 #include <cstring>            
                               
@@ -131,7 +133,7 @@ TaskScheduler::LiveTunables::LiveTunables(const Tunables& t) noexcept
 	, seekOnMiss(t.seekOnMiss)
 	, ioQuietWindowUs(t.ioQuietWindowUs)
 	, reservedStealing(t.reservedStealing)
-	, laneIntake(t.laneIntake)
+	, injector(t.injector)
 	, bareWaitHelp(t.bareWaitHelp)
 	, fastSpinTries(t.fastSpinTries < 0 ? JLIBSCHED_FAST_SPIN_TRIES : t.fastSpinTries) {}
 
@@ -151,10 +153,10 @@ std::uint64_t TaskScheduler::PoolGeneration() noexcept {
 }
 
 bool TaskScheduler::TimersEnabled() noexcept { return CurrentConfig().timers; }
-bool TaskScheduler::IoReactorEnabled() noexcept { return CurrentConfig().io; }
-unsigned TaskScheduler::IoCompletionThreads() noexcept { return CurrentConfig().ioCompletionThreads; }
 bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
-bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
+
+std::atomic<void (*)()> JLib::detail::g_ioStartHook{ nullptr };
+std::atomic<void (*)()> JLib::detail::g_ioStopHook{ nullptr };
 
 TaskAllocator::Usage TaskScheduler::SlabUsage() {
 	if (!instance) return TaskAllocator::Usage{};
@@ -244,7 +246,6 @@ size_t TaskScheduler::GetSafeTC() {
 
 	unsigned int reserved = 1;
 	if (c.timers) reserved += 1;
-	if (c.io)     reserved += c.ioCompletionThreads;
 	reserved += c.reservedCores;
 	if (cores <= reserved) return 1;
 	return static_cast<size_t>(cores - reserved);
@@ -272,14 +273,16 @@ void TaskScheduler::Init(const Config& requested) {
 	Config cfg = requested;
 	if (cfg.main == MainMode::Default)
 		cfg.main = (cfg.mode == Mode::Migrate) ? MainMode::InPool : MainMode::OutOfPool;
-	if (cfg.ioCompletionThreads == 0) cfg.ioCompletionThreads = 1;
 	if (cfg.hotWorkers > kMaxReservedWorkers) cfg.hotWorkers = kMaxReservedWorkers;
-	// I/O needs no K: the reactor hands completions to the pool as jobs (hi-pri inboxes).
-	if (cfg.io) cfg.timers = true;
 	detail::SlabGrowthEnabled().store(cfg.slabGrowth, std::memory_order_relaxed);
+	detail::MemoryInit(cfg.arenaReserveBytes, cfg.arenaCommit);   // before any pool thread exists
 
 	instance = new TaskScheduler(cfg);
 	instance->StartPool(cfg.workers);
+
+	// I/O started before Init left a start hook: run it once, now that the pool can take
+	// completions (see detail::g_ioStartHook). Exchange, so a restart does not replay it.
+	if (void (*startIo)() = detail::g_ioStartHook.exchange(nullptr, std::memory_order_acq_rel)) startIo();
 
 	{
 		char buf[16] = {};
@@ -331,7 +334,8 @@ TaskScheduler::~TaskScheduler() {
 bool TaskScheduler::PushMain(Task* task) {
 	if (!poolActive) return false;
 	if (!task) return false;
-	task->type = TaskType::Main;
+	// Where it STARTS, nothing more: its type (how it runs) is left alone, and where it resumes is
+	// whatever pin each suspension passes (Pin::Main to come back here).
 	PushMainQueue(task);
 	return true;
 }
@@ -358,6 +362,7 @@ void TaskScheduler::RunMainTask(Task* t) {
 		Thread* self = Thread::GetCurrent();
 		if (self) { self->RunHelped(t); return; }
 	}
+	if (t->record) t->record->home = Thread::GetCurrent();   // see TaskRecord::home
 	t->Execute();
 	if (t->waitGroup) {
 		t->waitGroup->Done();
@@ -466,25 +471,25 @@ void TaskScheduler::Join() {
 
 	stopFlag.store(true, std::memory_order_release);
 
-	if (IoReactorEnabled() && IoReactor::IsAvailable())
-		IoReactor::Instance().Stop();
+	// If the program started I/O, drain it while the pool still runs (see detail::g_ioStopHook).
+	if (void (*stopIo)() = detail::g_ioStopHook.load(std::memory_order_acquire)) stopIo();
 	if (TimersEnabled())
 		TimerQueue::Instance().Stop();
 
 	{
 		
-		const bool intakeWasOn = LaneIntakeEnabled();
-		SetLaneIntake(false);
+		const bool intakeWasOn = InjectorEnabled();
+		SetInjector(false);
 
 		size_t rescued = 0;
-		while (Task* t = TakeLaneIntake()) {
+		while (Task* t = TakeInjector()) {
 			PushTarget(t, kAnyWorker);   
 			++rescued;
 		}
-		SetLaneIntake(intakeWasOn);
+		SetInjector(intakeWasOn);
 		if (rescued) {
 			fprintf(stderr, "[JLib::Scheduler] teardown: moved %zu queued I/O completion(s) from the\n"
-			                "  shared lane intake to the floor. Not an error -- the reserved band was\n"
+			                "  shared injector to the floor. Not an error -- the reserved band was\n"
 			                "  stopping and the floor is the queue that is always drainable.\n",
 			        rescued);
 			fflush(stderr);
@@ -596,15 +601,17 @@ void TaskScheduler::Join() {
 		if (mainDrives) workers[0]->ReleaseCurrentThread();
 		if (mainHelper) {
 			mainHelper->ReleaseCurrentThread();   // only clears the binding if called on main
+			detail::MemoryReleaseThread(mainHelper);
 			delete mainHelper;
 			mainHelper = nullptr;
 		}
-		for (Thread* w : workers) delete w;
+		for (Thread* w : workers) { detail::MemoryReleaseThread(w); delete w; }
 		workers.clear();
 		mainQ.clear();
 		poolMutex.unlock();
 	}
 
+	detail::MemoryShutdown();   // every pool Thread (and its theap pointer) is gone by now
 	poolActive.store(false, std::memory_order_release);
 }
 
@@ -855,8 +862,8 @@ void     TaskScheduler::SetIoQuietWindowUs(unsigned us) noexcept { live_.ioQuiet
 unsigned TaskScheduler::IoQuietWindowUs() const noexcept       { return live_.ioQuietWindowUs.load(std::memory_order_relaxed); }
 void     TaskScheduler::SetReservedStealing(bool on) noexcept   { live_.reservedStealing.store(on, std::memory_order_relaxed); }
 bool     TaskScheduler::ReservedStealing() const noexcept      { return live_.reservedStealing.load(std::memory_order_relaxed); }
-void     TaskScheduler::SetLaneIntake(bool on) noexcept         { live_.laneIntake.store(on, std::memory_order_relaxed); }
-bool     TaskScheduler::LaneIntakeEnabled() const noexcept     { return live_.laneIntake.load(std::memory_order_relaxed); }
+void     TaskScheduler::SetInjector(bool on) noexcept         { live_.injector.store(on, std::memory_order_relaxed); }
+bool     TaskScheduler::InjectorEnabled() const noexcept     { return live_.injector.load(std::memory_order_relaxed); }
 void     TaskScheduler::SetBareWaitHelp(bool on) noexcept       { live_.bareWaitHelp.store(on, std::memory_order_relaxed); }
 bool     TaskScheduler::BareWaitHelp() const noexcept          { return live_.bareWaitHelp.load(std::memory_order_relaxed); }
 #if defined(JLIBSCHED_TUNABLE_FAST_SPIN)
@@ -898,7 +905,7 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 
 		if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
 		t->waitGroup = &wg;
-		
+
 		if (!Push(t)) { wg.n.fetch_sub(1, std::memory_order_acq_rel); FreeTask(t); }
 	}
 
@@ -1431,7 +1438,6 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	size_t standardFiberCount = compute * NormalFibersPerComputeWorker();
 
 	globalPool = GlobalFiberPool::Create(standardFiberCount,
-	                                     kBand   * TinyFibersPerKWorker(),
 	                                     compute * DeepFibersPerComputeWorker(),
 	                                     FiberMemoryLimit());
 	
@@ -1511,8 +1517,6 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	const size_t fairShare = standardFiberCount / (num_workers ? num_workers : 1);
 	const size_t fiberCacheCapacity = (fairShare / 2 < 16) ? 16 : fairShare / 2;
 
-	if (IoReactorEnabled() && IoReactor::IsAvailable())
-		IoReactor::Instance().Start();
 	if (TimersEnabled())
 		TimerQueue::Instance().Start();
 
@@ -1589,11 +1593,11 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName, Pin pin) { WaitOnE
 bool TaskScheduler::Push(Task* task) {
 	JLIB_STAT(Pushes);
 	// A pool thread other than main keeps its own pushes on its own deque. Main distributes.
-	// Latency work is the exception: with K it goes to the lane intake (PushTarget), or it would
+	// Latency work is the exception: with K it goes to the injector (PushTarget), or it would
 	// wait behind whatever this worker is running.
 	Thread* self = Thread::GetCurrent();
 	if (task && self && self->IsPoolWorker() && !self->isMain
-	    && !(IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled())) {
+	    && !(IsLowLatency(task->lane) && HiPriLaneActive() && InjectorEnabled())) {
 		if (!deques[(size_t)self->qIndex]->push_bottom(task)) TaskDeque::FatalPushRefused();
 		return true;
 	}
@@ -1625,17 +1629,20 @@ unsigned TaskScheduler::LastBareWaitPolls()  noexcept { return t_bareWaitPolls; 
 unsigned TaskScheduler::LastBareWaitYields() noexcept { return t_bareWaitYields; }
 unsigned TaskScheduler::LastBareWaitHelped() noexcept { return t_bareWaitHelped; }
 bool TaskScheduler::WaitFor(WaitGroup* wg, bool (*pred)(void*), void* arg, Pin pin) {
-	CheckSuspendableCurrent("TaskScheduler::WaitFor");
 	Thread* thread = Thread::GetCurrent();
 	Thread::WaitCtx ctx;
 	ctx.wg = wg;
 	ctx.pred = pred;
 	ctx.arg = arg;
+	// In-pool main helps rather than suspends, native task or not -- same as WaitFor(WaitGroup&).
 	if (thread && thread->isMain && !thread->currentFiber) {
+		Task* const waiter = thread->currentRunningTask;
 		const bool r = thread->MainWorker(&ctx);
+		thread->currentRunningTask = waiter;
 		if (wg) wg->Settle();
 		return r;
 	}
+	CheckSuspendableCurrent("TaskScheduler::WaitFor");
 
 	// Anyone else: plain wait on the group, polling the predicate.
 	unsigned spins = 0;
@@ -1657,19 +1664,28 @@ namespace {
 #endif
 
 void TaskScheduler::WaitFor(WaitGroup& wg, Pin pin) {
-	CheckSuspendableCurrent("TaskScheduler::WaitFor");   // lambda tasks run without a fiber
 	JLIB_STAT_ONLY(StatWaitTimer statWait;)
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
 
 	// In-pool main outside a fiber: run pool work until the group is done (blocks on its wait word).
+	// This includes a NATIVE task running on main (a main DAG node, a PushMain lambda): main's own
+	// wait already helps rather than suspends, so there is nothing for a fiber to do here, and main
+	// keeps serving its inbox -- which is what makes a blocking wait dangerous on any other thread.
+	// Checked before the native abort below for exactly that reason.
 	if (thread && thread->isMain && !current) {
 		Thread::WaitCtx ctx;
 		ctx.wg = &wg;
+		// The nested loop runs other tasks and overwrites this; the native task that called us
+		// resumes after the wait and must still be the current one (task-locals, GetCurrentTask).
+		Task* const waiter = thread->currentRunningTask;
 		thread->MainWorker(&ctx);
+		thread->currentRunningTask = waiter;
 		wg.Settle();
 		return;
 	}
+
+	CheckSuspendableCurrent("TaskScheduler::WaitFor");   // anywhere else, a native task cannot wait
 
 	if (current != nullptr) {
 		
@@ -1840,32 +1856,26 @@ bool TaskScheduler::PushTo(size_t worker, Task* task) {
 }
 
 
-bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
+bool TaskScheduler::PushInjector(Task** tasks, size_t n) noexcept {
 	if (!tasks || n == 0) return false;
 	TaskScheduler* s = instance;
 	
 	if (!s || !s->poolActive) return false;
-	if (GetHotWorkers() == 0) return false;      // the lane is K's: no K, no lane
 
-	if (!s->laneIntake.enqueue_bulk(tasks, n)) return false;
-	s->laneIntakeCount_.fetch_add((long long)n, std::memory_order_seq_cst);
+	if (!s->injector.enqueue_bulk(tasks, n)) return false;
+	// Read by the park recheck, so a worker on its way to park sees the work and stays up.
+	s->injectorCount_.fetch_add((long long)n, std::memory_order_seq_cst);
 
 	s->ioLastPushNs_.store(MonotonicNs(), std::memory_order_relaxed);
 
-#if !defined(JLIB_LANEINTAKE_CTL_NO_NOTIFY)
-	
-	// Wake a PARKED reserved worker if there is one; an awake one would find the intake anyway,
-	// and notifying only a busy one would leave the sleepers asleep behind its body.
-	const size_t nAll = s->workers.size();
-	size_t target = nAll;
-	for (size_t w = ReservedBase(nAll); w < nAll; ++w) {
-		if (!s->workers[w]) continue;
-		if (target == nAll) target = w;
-		if (s->workers[w]->workerState.load(std::memory_order_seq_cst) == Thread::WS_PARKED) { target = w; break; }
-	}
-	if (target < nAll) { s->workers[target]->MarkQueuedWork(); s->workers[target]->NotifyWorker(); }
-#else
-	
+	// No wake. Every worker takes from the injector each pass, and the last hunter never parks
+	// while the pool is live, so someone is always about to look. The hunt's handoff brings in
+	// more workers if the batch outlasts it.
+#if defined(JLIB_INJECTOR_CTL_WAKE_ONE)
+	// A/B only: one idle worker per bulk inject, to see whether a batch spreads faster.
+	const size_t idleQ = PopIdleWorker();
+	if (idleQ != kNoIdleWorker && idleQ < s->workers.size() && s->workers[idleQ])
+		s->workers[idleQ]->NotifyWorker();
 #endif
 	return true;
 }
@@ -1893,21 +1903,21 @@ bool TaskScheduler::IoLaneQuiet() noexcept {
 	return (MonotonicNs() - last) > win;
 }
 
-Task* TaskScheduler::TakeLaneIntake() noexcept {
+Task* TaskScheduler::TakeInjector() noexcept {
 	TaskScheduler* s = instance;
 	if (!s || !s->poolActive) return nullptr;
-	if (s->laneIntakeCount_.load(std::memory_order_seq_cst) <= 0) return nullptr;
+	if (s->injectorCount_.load(std::memory_order_seq_cst) <= 0) return nullptr;
 	Task* t = nullptr;
-	if (!s->laneIntake.try_dequeue(t)) return nullptr;
-	s->laneIntakeCount_.fetch_sub(1, std::memory_order_relaxed);
+	if (!s->injector.try_dequeue(t)) return nullptr;
+	s->injectorCount_.fetch_sub(1, std::memory_order_relaxed);
 	return t;
 }
 
-bool TaskScheduler::LaneIntakeIdle() noexcept {
+bool TaskScheduler::InjectorIdle() noexcept {
 	TaskScheduler* s = instance;
 	if (!s || !s->poolActive) return true;
-	return s->laneIntakeCount_.load(std::memory_order_seq_cst) <= 0
-	    && s->laneIntake.size_approx() == 0;
+	return s->injectorCount_.load(std::memory_order_seq_cst) <= 0
+	    && s->injector.size_approx() == 0;
 }
 
 bool TaskScheduler::PushIO(Task* task) noexcept {
@@ -2034,8 +2044,10 @@ Task* TaskScheduler::GetTask() {
 	
 	const unsigned thiefCpu = JLib::platform::CurrentCpu();
 	
+	// Coroutines only -- see the assert below. A Native task also needs no fiber, but spin-help is
+	// not allowed to run one: this runs on a thread that may not be a pool worker.
 	auto fiberlessRunnable = [&](StealBits sb) {
-		return sb.type != TaskType::Fiber && sb.type != TaskType::Main;
+		return sb.type == TaskType::Coroutine;
 	};
 
 	size_t numThreads = deques.size();
@@ -2098,6 +2110,7 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// elsewhere and a finished one freed itself, so the task is not touched after the call.
 	assert(task->type == TaskType::Coroutine && "spin-help runs coroutines only");
 	task->started = 1;
+	task->record->home = Thread::GetCurrent();   // see TaskRecord::home
 	task->Execute();
 	return true;
 }
@@ -2108,6 +2121,12 @@ TaskAllocator* TaskScheduler::GetAllocator() {
 
 size_t TaskScheduler::GetWorkerCount() const {
 	return workers.size();
+}
+
+const std::vector<Thread*>& TaskScheduler::GetWorkers() noexcept {
+	static const std::vector<Thread*> kNone;
+	TaskScheduler* inst = instance;
+	return inst ? inst->workers : kNone;
 }
 
 void TaskScheduler::PrefaultTaskSlots(size_t slots) {
@@ -2121,7 +2140,6 @@ bool TaskScheduler::SlabGrowthEnabled() noexcept {
 TaskScheduler::SlabSizes TaskScheduler::CurrentSlabSizes() { return CurrentConfig().slab; }
 
 size_t TaskScheduler::NormalFibersPerComputeWorker() { return CurrentConfig().fibers.normalPerComputeWorker; }
-size_t TaskScheduler::TinyFibersPerKWorker()         { return CurrentConfig().fibers.tinyPerKWorker; }
 size_t TaskScheduler::DeepFibersPerComputeWorker()   { return CurrentConfig().fibers.deepPerComputeWorker; }
 size_t TaskScheduler::FiberMemoryLimit()             { return CurrentConfig().fiberMemoryLimit; }
 
@@ -2269,19 +2287,18 @@ void TaskScheduler::ReleaseRecord(TaskRecord* r) noexcept {
 		taskAllocator.Free(r->locals);
 		r->locals = nullptr;
 	}
-	if (r->debts) {                       // only "any holder" debts can be left by now
-		detail::HandOffFiberDebts(r->debts);
+	if (r->debts) {
+		detail::HandOffTaskDebts(r->debts);   // drained by a pool task, not here
 		r->debts = nullptr;
 	}
 	r->~TaskRecord();
 	taskAllocator.Free(r);
 }
 
-bool TaskScheduler::HasFiberLocal() noexcept { return CurrentRecord() != nullptr; }
-
-uint16_t TaskScheduler::AllocFiberLocalSlot() noexcept { return AllocTaskLocalSlot(); }
-
-bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
+// The node's storage is the CALLER'S -- usually a member of the object being released, so there is
+// nothing to allocate here and nothing to free if the task dies early. Pushed on the front, so the
+// list releases newest first.
+bool TaskScheduler::ReleaseOnTaskDeath(TaskDebt& node, void* obj,
                                         void (*release)(void*) noexcept) noexcept {
 	if (!obj || !release) return false;
 	TaskRecord* r = CurrentRecord();
@@ -2289,23 +2306,11 @@ bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
 
 	node.obj     = obj;
 	node.release = release;
-	node.holder  = FiberDebt::kAnyHolder;
 
 	node.next = r->debts;
 	r->debts  = &node;
 	return true;
 }
-
-void*& TaskScheduler::FiberLocal(size_t slot) noexcept {
-	static thread_local void* t_offTask = nullptr;
-	void** block = (slot < TaskRecord::kLocalSlots) ? CurrentLocals() : nullptr;
-	if (!block) {
-		t_offTask = nullptr;
-		return t_offTask;
-	}
-	return block[slot];
-}
-
 
 
 Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type,
@@ -2363,9 +2368,9 @@ bool TaskScheduler::PushTarget(Task* task, size_t worker) {
 		workers[idx]->NotifyWorker();
 	}
 	else {
-		// Latency work goes to the shared lane intake, never one worker's inbox (the hi-pri inbox is
+		// Latency work goes to the shared injector, never one worker's inbox (the hi-pri inbox is
 		// PushTo's). Refused by the intake -- off, or no K -- it is placed like normal work.
-		if (IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+		if (IsLowLatency(task->lane) && HiPriLaneActive() && InjectorEnabled() && PushInjector(&task, 1))
 			return true;
 
 		const uint8_t chosen = (uint8_t)PickNextWorker(Lane::Normal);
@@ -2502,7 +2507,7 @@ JLib::ThreadScope::~ThreadScope() {
 }
 
 // The calling thread, if it is a full-time compute worker of this pool; else null.
-static Thread* ComputeSelf(TaskScheduler& s, const std::vector<Thread*>& workers) {
+ static Thread* ComputeSelf(TaskScheduler& s, const std::vector<Thread*>& workers) {
 	Thread* self = Thread::GetCurrent();
 	if (!self || self->isMain) return nullptr;
 	const size_t q = (size_t)self->qIndex;
@@ -2512,20 +2517,17 @@ static Thread* ComputeSelf(TaskScheduler& s, const std::vector<Thread*>& workers
 	return self;
 }
 
+enum class RequeueResult { Failed, Pinned, Stealable };
 void TaskScheduler::ResumeFiber(Task* task) {
 	if (!task) return;
-	if (task->type == TaskType::Main) { PushMainQueue(task); return; }
+
 	const uint16_t pin = task->record->pinTo;
-	if (pin == Pin::kMain) { JLIB_STAT(ResumePinned); PushMainQueue(task); return; }
-	if (pin != TaskRecord::kNoPin) { JLIB_STAT(ResumePinned); PushTo(pin, task); return; }   // hi-pri inbox, never stolen
-	if (IsNormalLane(task->lane)) {
-		if (Thread* self = ComputeSelf(*this, workers)) {
-			JLIB_STAT(ResumeLocal);
-			if (!deques[(size_t)self->qIndex]->push_bottom(task)) TaskDeque::FatalPushRefused();
-			return;
-		}
+	if (pin == Pin::kMain) { PushMainQueue(task); return; }
+	if (pin != TaskRecord::kNoPin) { PushTo(pin, task); return; }   // hi-pri inbox, never stolen
+	if (Thread* self = ComputeSelf(*this, workers)) {
+		if (!deques[(size_t)self->qIndex]->push_bottom(task)) TaskDeque::FatalPushRefused();
+		return;
 	}
-	JLIB_STAT(ResumePlaced);
 	Requeue(task);   // unpinned, off a compute worker: placement
 }
 
@@ -2534,7 +2536,6 @@ bool TaskScheduler::YieldFiber(Task* task) {
 	Thread* self = Thread::GetCurrent();
 	if (!self || !self->IsPoolWorker()) { ResumeFiber(task); return false; }   // a yield off the pool: place it
 	const size_t q = (size_t)self->qIndex;
-	if (task->type == TaskType::Main) { PushMainQueue(task); return self->isMain; }
 	const uint16_t pin = task->record->pinTo;
 	if (pin == Pin::kMain) { JLIB_STAT(ResumePinned); PushMainQueue(task); return self->isMain; }
 	if (pin == q) {   // pinned here: own hi-pri inbox, no wake needed
@@ -2553,16 +2554,8 @@ bool TaskScheduler::YieldFiber(Task* task) {
 	Requeue(task);
 	return false;
 }
-
-bool TaskScheduler::WakeTask(Task* task) {
-	if (!task) return false;
-	if (task->started) { ResumeFiber(task); return true; }
-	return Push(task);
-}
-
 TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	if (!task) return RequeueResult::Failed;
-	if (task->type == TaskType::Main) { PushMainQueue(task); return RequeueResult::Pinned; }
 
 	const uint16_t pin = task->record->pinTo;
 	if (pin == Pin::kMain) { PushMainQueue(task); return RequeueResult::Pinned; }
@@ -2575,7 +2568,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	}
 
 	// Same placement as PushTarget: latency work to the shared intake, never a worker's inbox.
-	if (IsLowLatency(task->lane) && HiPriLaneActive() && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+	if (IsLowLatency(task->lane) && HiPriLaneActive() && InjectorEnabled() && PushInjector(&task, 1))
 		return RequeueResult::Stealable;
 
 	const uint8_t chosen = (uint8_t)PickNextWorker(Lane::Normal);
@@ -2584,7 +2577,15 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	workers[chosen]->NotifyWorker();
 
 	return RequeueResult::Pinned;
+}		// External waiters (locks, semaphore, future, acceptor, I/O) wake a task here. A started task
+
+bool TaskScheduler::WakeTask(Task* task) {
+	if (!task) return false;
+	if (task->started) { ResumeFiber(task); return true; }
+	return Push(task);
 }
+
+
 
 int TaskScheduler::PickNextWorker(Lane lane) {
 	
@@ -3170,7 +3171,6 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex, Pin pin) {
 
 		mutex.Unlock();
 
-		CheckSuspendableCurrent("SchedulerConditionVariable::Wait");
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerConditionVariable::Wait");
 		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
@@ -3214,7 +3214,6 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex, Pi
 
 		mutex.Unlock();
 
-		CheckSuspendableCurrent("SchedulerConditionVariable::WaitCancellable");
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerConditionVariable::WaitCancellable");
 		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);

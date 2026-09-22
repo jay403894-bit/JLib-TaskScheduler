@@ -36,11 +36,6 @@ void JLib::CheckSuspendableCurrent(const char* where) noexcept {
 	if (Thread* t = Thread::GetCurrent()) CheckSuspendable(t->currentRunningTask, where);
 }
 
-void Fiber::Resume() {
-	if (ResumeQueueless())
-		TaskScheduler::Instance().ResumeFiber(this->owningTask);
-}
-
 void JLib::RequeueResumedBatch(Task** tasks, size_t n, Lane lane) {
 	if (n == 0) return;
 
@@ -49,8 +44,9 @@ void JLib::RequeueResumedBatch(Task** tasks, size_t n, Lane lane) {
 	for (size_t i = 0; i < n; ++i) sched.ResumeFiber(tasks[i]);
 }
 
-#if defined(JLIB_TSAN)
-namespace JLib { namespace detail {
-	void TsanSwitchToScheduler() noexcept { Thread::TsanSwitchToScheduler(); }
-} }
-#endif
+void JLib::RequeueResume(Task* task)
+{
+	auto& sched = TaskScheduler::Instance();
+	sched.ResumeFiber(task);
+}
+

@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
 		constexpr int kThreads = 8, kEach = 20000;
 		std::vector<std::thread> ts;
 		for (int t = 0; t < kThreads; ++t)
-			ts.emplace_back([] {
+			ts.emplace_back([kEach] {
 				ThreadScope scope;
 				EpochManager& em = EpochManager::Instance();
 				for (int i = 0; i < kEach; ++i) {

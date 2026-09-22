@@ -1,4 +1,4 @@
-// K steal policy: K=2, Pin ("p") or Migrate (default).
+﻿// K steal policy: K=2, Pin ("p") or Migrate (default).
 //  quiet lane : Native + suspending Fiber mix. Everything completes; in Pin mode no fiber starts on K.
 //  hot lane   : a producer floods the I/O lane while bulk work runs. Everything completes.
 #include <TaskScheduler.h>
@@ -60,7 +60,7 @@ static void YieldBody(void*) {
 		if (IsK(CurQ())) g_yieldOnK.fetch_add(1);
 		volatile unsigned x = 0;
 		for (unsigned j = 0; j < 5000; ++j) x += j;
-		Thread::CoYield();
+		Thread::Yield();
 	}
 	g_yieldRan.fetch_add(1);
 }
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
 	g_n = s.GetWorkerCount();
 	g_k = TaskScheduler::GetHotWorkers();
 	std::printf("mode=%s workers=%zu K=%zu intake=%d quietWindow=%uus\n",
-		pin ? "Pin" : "Migrate", g_n, g_k, (int)s.LaneIntakeEnabled(),
+		pin ? "Pin" : "Migrate", g_n, g_k, (int)s.InjectorEnabled(),
 		s.IoQuietWindowUs());
 
 	std::printf("[quiet lane: 4000 Native + 1000 suspending Fiber]\n");
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
 		for (int i = 0; i < NN + NF; ++i) {
 			const bool fiber = (i % 5) == 0;
 			Task* t = fiber ? s.CreateTask(&FiberBody, nullptr, Lane::Normal, TaskType::Fiber)
-			                : s.CreateTask(&NativeBody, nullptr, Lane::Normal, TaskType::Fiber);
+			                : s.CreateTask(&NativeBody, nullptr, Lane::Normal, TaskType::Native);
 			t->waitGroup = &wg;
 			s.Push(t);
 		}
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
 		for (int i = 0; i < NN + NF; ++i) {
 			const bool fiber = (i % 9) == 0;
 			Task* t = fiber ? s.CreateTask(&FiberBody, nullptr, Lane::Normal, TaskType::Fiber)
-			                : s.CreateTask(&NativeBody, nullptr, Lane::Normal, TaskType::Fiber);
+			                : s.CreateTask(&NativeBody, nullptr, Lane::Normal, TaskType::Native);
 			t->waitGroup = &wg;
 			s.Push(t);
 		}

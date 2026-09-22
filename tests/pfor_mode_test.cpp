@@ -1,4 +1,4 @@
-// ParallelFor in each PforMode (Cursor, LazyPCore) runs every index exactly once: from main
+﻿// ParallelFor in each PforMode (Cursor, LazyPCore) runs every index exactly once: from main
 // and from inside a fiber task, over sizes and grains that force splits, uneven tails and single
 // grains. Also PushTo(CorePref): every class, both inboxes, all tasks run.
 // Arg: "i" main in the pool, "o" main out of it.
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
 		Task* t = s.CreateTask([](void* p) {
 			auto* x = static_cast<InTask*>(p);
 			x->ok = Sweep(*x->s);
-		}, &it);
+		}, &it, Lane::Normal, TaskType::Fiber);
 		t->waitGroup = &wg;
 		s.Push(t);
 		s.WaitFor(wg);
