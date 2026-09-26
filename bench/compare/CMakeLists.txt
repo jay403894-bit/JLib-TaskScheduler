@@ -1,0 +1,47 @@
+
+set(_compare_libs "")
+
+add_executable(SchedulerCompare "${CMAKE_CURRENT_SOURCE_DIR}/compare.cpp")
+target_link_libraries(SchedulerCompare PRIVATE Scheduler)
+target_compile_features(SchedulerCompare PRIVATE cxx_std_20)
+target_compile_definitions(SchedulerCompare PRIVATE JLIBSCHED_VERSION_STRING="${JLIBSCHED_VERSION}")
+
+if(JLIBSCHED_MARL_DIR)
+    if(NOT EXISTS "${JLIBSCHED_MARL_DIR}/include/marl/scheduler.h")
+        message(FATAL_ERROR "compare: no marl at ${JLIBSCHED_MARL_DIR}")
+    endif()
+    add_subdirectory("${JLIBSCHED_MARL_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/marl-build" EXCLUDE_FROM_ALL)
+    target_link_libraries(SchedulerCompare PRIVATE marl)
+    target_compile_definitions(SchedulerCompare PRIVATE JLIBSCHED_HAVE_MARL=1)
+    list(APPEND _compare_libs marl)
+endif()
+
+if(JLIBSCHED_ENKITS_DIR)
+    if(NOT EXISTS "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h")
+        message(FATAL_ERROR "compare: no enkiTS at ${JLIBSCHED_ENKITS_DIR}")
+    endif()
+    set(_enki_alias "${CMAKE_CURRENT_BINARY_DIR}/enki_include")
+    file(MAKE_DIRECTORY "${_enki_alias}")
+    file(WRITE "${_enki_alias}/TaskScheduler_enki.h"
+         "#pragma once\n#include \"${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h\"\n")
+    target_sources(SchedulerCompare PRIVATE "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.cpp")
+    target_include_directories(SchedulerCompare PRIVATE "${_enki_alias}")
+    target_compile_definitions(SchedulerCompare PRIVATE JLIBSCHED_HAVE_ENKI=1)
+    list(APPEND _compare_libs enkiTS)
+endif()
+
+if(JLIBSCHED_TASKFLOW_DIR)
+    if(NOT EXISTS "${JLIBSCHED_TASKFLOW_DIR}/taskflow/taskflow.hpp")
+        message(FATAL_ERROR "compare: no Taskflow at ${JLIBSCHED_TASKFLOW_DIR}")
+    endif()
+    target_include_directories(SchedulerCompare PRIVATE "${JLIBSCHED_TASKFLOW_DIR}")
+    target_compile_definitions(SchedulerCompare PRIVATE JLIBSCHED_HAVE_TASKFLOW=1)
+    list(APPEND _compare_libs Taskflow)
+endif()
+
+if(_compare_libs)
+    message(STATUS "compare: SchedulerCompare with ${_compare_libs} (JLib is always built in)")
+else()
+    message(STATUS "compare: SchedulerCompare built with JLib only -- set JLIBSCHED_MARL_DIR, "
+                   "JLIBSCHED_ENKITS_DIR or JLIBSCHED_TASKFLOW_DIR for the others")
+endif()
